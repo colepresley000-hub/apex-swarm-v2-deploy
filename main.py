@@ -96,6 +96,15 @@ def init_db():
                 completed_at TEXT,
                 FOREIGN KEY (user_api_key) REFERENCES users(api_key)
             );
+            CREATE TABLE IF NOT EXISTS knowledge (
+                id TEXT PRIMARY KEY,
+                agent_type TEXT NOT NULL,
+                pattern TEXT NOT NULL,
+                source_task_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                usefulness_score INTEGER DEFAULT 0,
+                FOREIGN KEY (source_task_id) REFERENCES agents(id)
+            );
         """)
         conn.commit()
         conn.close()
