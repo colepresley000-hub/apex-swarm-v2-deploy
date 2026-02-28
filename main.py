@@ -15,9 +15,38 @@ from contextlib import asynccontextmanager
 
 import httpx
 
+import httpx
+
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
+
+# Config
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+MONTHLY_AGENT_LIMIT = int(os.getenv("MONTHLY_AGENT_LIMIT", "20"))
+
+# Agent Registry - add new agents here, no code changes needed
+AGENTS = {
+    "research": {"name": "Research Analyst", "category": "Crypto & DeFi", "prompt": "You are a crypto research analyst. Provide actionable insights with specific data points. Max 3 paragraphs."},
+    "arbitrage": {"name": "Arbitrage Scanner", "category": "Crypto & DeFi", "prompt": "You are a crypto arbitrage scanner. Identify opportunities across DEXes/CEXes with pairs, spreads, platforms. Max 3 paragraphs."},
+    "defi": {"name": "DeFi Yield Analyst", "category": "Crypto & DeFi", "prompt": "You are a DeFi yield analyst. Identify best yield farming and lending opportunities with protocols, APYs, risk levels. Max 3 paragraphs."},
+    "token-analysis": {"name": "Token Analyzer", "category": "Crypto & DeFi", "prompt": "You are a token analysis expert. Evaluate tokenomics, utility, team, market position. Include market cap and risk. Max 3 paragraphs."},
+    "whale-tracker": {"name": "Whale Tracker", "category": "Crypto & DeFi", "prompt": "You are a whale movement analyst. Analyze large wallet movements and what they signal. Max 3 paragraphs."},
+    "code-writer": {"name": "Code Writer", "category": "Coding & Dev", "prompt": "You are an expert software engineer. Write clean, production-ready code with error handling and best practices."},
+    "code-reviewer": {"name": "Code Reviewer", "category": "Coding & Dev", "prompt": "You are a senior code reviewer. Find bugs, security issues, performance problems. Give specific actionable feedback."},
+    "debugger": {"name": "Debugger", "category": "Coding & Dev", "prompt": "You are an expert debugger. Identify root cause and provide clear fix with corrected code."},
+    "api-builder": {"name": "API Builder", "category": "Coding & Dev", "prompt": "You are an API architect. Design RESTful APIs with endpoints, schemas, auth, error handling. Output working code."},
+    "database-architect": {"name": "Database Architect", "category": "Coding & Dev", "prompt": "You are a database architect. Design schemas, write queries, optimize performance. Include SQL/NoSQL recommendations."},
+    "copywriter": {"name": "Copywriter", "category": "Writing & Content", "prompt": "You are an expert copywriter. Write compelling conversion-focused copy matching brand voice and target audience."},
+    "blog-writer": {"name": "Blog Writer", "category": "Writing & Content", "prompt": "You are a blog writer and SEO expert. Write engaging posts with SEO headings, keywords, and CTAs."},
+    "email-writer": {"name": "Email Writer", "category": "Writing & Content", "prompt": "You are an email marketing expert. Write effective sequences, outreach, newsletters. Focus on engagement and CTAs."},
+    "social-media": {"name": "Social Media Agent", "category": "Writing & Content", "prompt": "You are a social media strategist. Create platform-specific content with hashtags, hooks, engagement strategies."},
+    "data-analyst": {"name": "Data Analyst", "category": "Data & Research", "prompt": "You are a senior data analyst. Analyze data, identify trends, calculate metrics, provide actionable insights."},
+    "market-researcher": {"name": "Market Researcher", "category": "Data & Research", "prompt": "You are a market research analyst. Analyze trends, competitive landscapes, customer segments, growth opportunities."},
+    "report-writer": {"name": "Report Writer", "category": "Data & Research", "prompt": "You are a report writer. Create structured reports with executive summaries, findings, analysis, recommendations."},
+    "competitor-analyst": {"name": "Competitor Analyst", "category": "Data & Research", "prompt": "You are a competitive intelligence analyst. Analyze competitors products, pricing, positioning, strengths, weaknesses."},
+}
 
 # ─── CONFIG ────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -106,6 +135,17 @@ def verify_api_key(request: Request) -> str:
     return api_key
 
 
+def check_monthly_limit(api_key: str):
+    conn = get_db()
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    count = conn.execute("SELECT COUNT(*) FROM agents WHERE user_api_key = ? AND created_at >= ?", (api_key, month_start)).fetchone()[0]
+    conn.close()
+    if count >= MONTHLY_AGENT_LIMIT:
+        raise HTTPException(status_code=429, detail=f"Monthly limit reached ({MONTHLY_AGENT_LIMIT} agents). Resets on the 1st.")
+    return count
+
+
 # ─── LIFESPAN ─────────────────────────────────────────────
 
 @asynccontextmanager
@@ -170,7 +210,7 @@ async def dashboard_page():
     @media(max-width:640px){.grid{grid-template-columns:1fr}}</style>
     </head><body><div style="max-width:900px;margin:0 auto"><div class="header"><div class="logo">APEX SWARM</div><div style="color:#888;font-size:0.85rem" id="status">Connecting...</div></div>
     <div class="grid"><div class="card"><h2>Deploy Agent</h2>
-    <select id="agentType"><option value="research">Research Agent</option><option value="arbitrage">Arbitrage Agent</option><option value="defi">DeFi Yield Agent</option></select>
+    <select id="agentType"><optgroup label="Crypto & DeFi"><option value="research">Research Analyst</option><option value="arbitrage">Arbitrage Scanner</option><option value="defi">DeFi Yield Analyst</option><option value="token-analysis">Token Analyzer</option><option value="whale-tracker">Whale Tracker</option></optgroup><optgroup label="Coding & Dev"><option value="code-writer">Code Writer</option><option value="code-reviewer">Code Reviewer</option><option value="debugger">Debugger</option><option value="api-builder">API Builder</option><option value="database-architect">Database Architect</option></optgroup><optgroup label="Writing & Content"><option value="copywriter">Copywriter</option><option value="blog-writer">Blog Writer</option><option value="email-writer">Email Writer</option><option value="social-media">Social Media Agent</option></optgroup><optgroup label="Data & Research"><option value="data-analyst">Data Analyst</option><option value="market-researcher">Market Researcher</option><option value="report-writer">Report Writer</option><option value="competitor-analyst">Competitor Analyst</option></optgroup></select>
     <textarea id="taskDesc" rows="3" placeholder="Describe your task..."></textarea>
     <button class="btn" onclick="deploy()">Deploy Agent →</button></div>
     <div class="card"><h2>Active Tasks</h2><div id="tasks"><div style="color:#555;text-align:center;padding:20px">No tasks yet</div></div></div></div></div>
@@ -224,9 +264,9 @@ async def activate(req: ActivateRequest):
 @app.post("/api/v1/agents/deploy")
 async def deploy_agent(req: DeployRequest, api_key: str = Depends(verify_api_key)):
     """Deploy an agent. Starts background task execution."""
-    valid_types = ["research", "arbitrage", "defi"]
-    if req.agent_type not in valid_types:
-        raise HTTPException(status_code=400, detail=f"Agent type must be one of: {valid_types}")
+    if req.agent_type not in AGENTS:
+        raise HTTPException(status_code=400, detail=f"Unknown agent type: {req.agent_type}")
+    check_monthly_limit(api_key)
     
     if not req.task_description.strip():
         raise HTTPException(status_code=400, detail="Task description required")
@@ -288,18 +328,9 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str):
         if not ANTHROPIC_API_KEY:
             logger.warning("No ANTHROPIC_API_KEY set — using placeholder results")
             await asyncio.sleep(3)
-            results = {
-                "research": "Analysis complete: Found 12 relevant data points. Market sentiment shifted bullish in the last 24h.",
-                "arbitrage": "Scan complete: Identified 3 arbitrage opportunities. Best spread: 0.8% on ETH/USDC.",
-                "defi": "Yield scan complete: Aave USDC 4.2% APY, Compound ETH 3.8% APY, Curve 3pool 5.1% APY.",
-            }
-            result = results.get(agent_type, "Task completed")
+            result = f"[Placeholder] {AGENTS[agent_type]['name']} completed analysis of: {task_description[:100]}"
         else:
-            system_prompts = {
-                "research": "You are a crypto research analyst. Provide actionable insights with specific data. Max 3 paragraphs.",
-                "arbitrage": "You are a crypto arbitrage scanner. Identify opportunities across DEXes/CEXes with pairs, spreads, platforms. Max 3 paragraphs.",
-                "defi": "You are a DeFi yield analyst. Identify best yield farming and lending opportunities with protocols, APYs, risk levels. Max 3 paragraphs.",
-            }
+            system_prompt = AGENTS.get(agent_type, {}).get("prompt", "You are a helpful AI assistant.")
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
                     "https://api.anthropic.com/v1/messages",
@@ -311,7 +342,7 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str):
                     json={
                         "model": CLAUDE_MODEL,
                         "max_tokens": 1024,
-                        "system": system_prompts.get(agent_type, "You are a helpful AI assistant."),
+                        "system": system_prompt,
                         "messages": [{"role": "user", "content": task_description}],
                     },
                 )
