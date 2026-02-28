@@ -13,9 +13,15 @@ from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import httpx
+
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
+
+# ─── CONFIG ────────────────────────────────────────────────
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 # ─── LOGGING ───────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -239,7 +245,7 @@ async def deploy_agent(req: DeployRequest, api_key: str = Depends(verify_api_key
         conn.close()
     
     # Background task execution (placeholder - 3 second delay)
-    asyncio.create_task(execute_task(agent_id, req.agent_type))
+    asyncio.create_task(execute_task(agent_id, req.agent_type, req.task_description))
     
     logger.info(f"Agent deployed: {req.agent_type} ({agent_id[:8]})")
     return {"agent_id": agent_id, "status": "running"}
@@ -276,22 +282,51 @@ async def health_check():
 
 # ─── BACKGROUND TASK ──────────────────────────────────────
 
-async def execute_task(agent_id: str, agent_type: str):
-    """Simulate task execution. Replace with real Claude API later."""
+async def execute_task(agent_id: str, agent_type: str, task_description: str):
+    """Execute task using Claude API. Falls back to placeholder if no API key."""
     try:
-        await asyncio.sleep(3)  # Simulate processing
-        
-        results = {
-            "research": "Analysis complete: Found 12 relevant data points across 5 sources. Key insight: Market sentiment shifted bullish in the last 24h.",
-            "arbitrage": "Scan complete: Identified 3 potential arbitrage opportunities. Best spread: 0.8% on ETH/USDC across Uniswap-Sushiswap.",
-            "defi": "Yield scan complete: Top opportunities - Aave USDC 4.2% APY, Compound ETH 3.8% APY, Curve 3pool 5.1% APY.",
-        }
-        
+        if not ANTHROPIC_API_KEY:
+            logger.warning("No ANTHROPIC_API_KEY set — using placeholder results")
+            await asyncio.sleep(3)
+            results = {
+                "research": "Analysis complete: Found 12 relevant data points. Market sentiment shifted bullish in the last 24h.",
+                "arbitrage": "Scan complete: Identified 3 arbitrage opportunities. Best spread: 0.8% on ETH/USDC.",
+                "defi": "Yield scan complete: Aave USDC 4.2% APY, Compound ETH 3.8% APY, Curve 3pool 5.1% APY.",
+            }
+            result = results.get(agent_type, "Task completed")
+        else:
+            system_prompts = {
+                "research": "You are a crypto research analyst. Provide actionable insights with specific data. Max 3 paragraphs.",
+                "arbitrage": "You are a crypto arbitrage scanner. Identify opportunities across DEXes/CEXes with pairs, spreads, platforms. Max 3 paragraphs.",
+                "defi": "You are a DeFi yield analyst. Identify best yield farming and lending opportunities with protocols, APYs, risk levels. Max 3 paragraphs.",
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": CLAUDE_MODEL,
+                        "max_tokens": 1024,
+                        "system": system_prompts.get(agent_type, "You are a helpful AI assistant."),
+                        "messages": [{"role": "user", "content": task_description}],
+                    },
+                )
+            if response.status_code != 200:
+                logger.error(f"Claude API error ({response.status_code}): {response.text[:200]}")
+                result = f"Agent error: Claude API returned {response.status_code}"
+            else:
+                data = response.json()
+                result = data["content"][0]["text"]
+
         conn = get_db()
         try:
             conn.execute(
                 "UPDATE agents SET status = 'completed', result = ?, completed_at = ? WHERE id = ?",
-                (results.get(agent_type, "Task completed"), datetime.now(timezone.utc).isoformat(), agent_id),
+                (result, datetime.now(timezone.utc).isoformat(), agent_id),
             )
             conn.commit()
             logger.info(f"Task completed: {agent_id[:8]}")
