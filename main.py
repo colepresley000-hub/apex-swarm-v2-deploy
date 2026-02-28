@@ -400,6 +400,17 @@ async def get_stats():
     }
 
 
+@app.get("/api/v1/agents")
+async def list_agents():
+    result = {}
+    for key, agent in AGENTS.items():
+        cat = agent["category"]
+        if cat not in result:
+            result[cat] = []
+        result[cat].append({"id": key, "name": agent["name"]})
+    return {"agents": result, "total": len(AGENTS)}
+
+
 @app.get("/api/v1/health")
 async def health_check():
     """Health check for deployment monitoring."""
