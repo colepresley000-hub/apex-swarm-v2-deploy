@@ -190,13 +190,43 @@ def get_db():
     return conn
 
 
+def _get_columns(conn, table: str) -> list[str]:
+    """Get column names for a table."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [r[1] for r in rows]
+    except Exception:
+        return []
+
+
+# Detect which column name the DB uses for the user key.
+# v2.1 used "api_key", v3.0 uses "user_api_key". We adapt to whatever exists.
+USER_KEY_COL = "user_api_key"  # default for fresh installs
+
+
 def init_db():
+    global USER_KEY_COL
     conn = get_db()
     try:
-        conn.executescript("""
+        # Check if agents table exists and which column name it uses
+        existing_cols = _get_columns(conn, "agents")
+
+        if existing_cols:
+            # Table exists — detect column name
+            if "api_key" in existing_cols and "user_api_key" not in existing_cols:
+                USER_KEY_COL = "api_key"
+                logger.info("📦 Detected v2.1 schema (api_key column) — adapting")
+            else:
+                USER_KEY_COL = "user_api_key"
+        else:
+            # Fresh install — create with v3 schema
+            USER_KEY_COL = "user_api_key"
+
+        # Create tables if they don't exist (fresh install)
+        conn.executescript(f"""
             CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
-                user_api_key TEXT NOT NULL,
+                {USER_KEY_COL} TEXT NOT NULL,
                 agent_type TEXT NOT NULL,
                 task_description TEXT NOT NULL,
                 status TEXT DEFAULT 'pending',
@@ -207,7 +237,7 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS knowledge (
                 id TEXT PRIMARY KEY,
-                user_api_key TEXT NOT NULL,
+                {USER_KEY_COL} TEXT NOT NULL,
                 agent_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 domain TEXT DEFAULT 'general',
@@ -219,7 +249,7 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS schedules (
                 id TEXT PRIMARY KEY,
-                user_api_key TEXT NOT NULL,
+                {USER_KEY_COL} TEXT NOT NULL,
                 agent_type TEXT NOT NULL,
                 task_description TEXT NOT NULL,
                 cron_expression TEXT NOT NULL,
@@ -232,14 +262,23 @@ def init_db():
                 created_at TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_api_key);
             CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
-            CREATE INDEX IF NOT EXISTS idx_knowledge_user ON knowledge(user_api_key);
-            CREATE INDEX IF NOT EXISTS idx_schedules_user ON schedules(user_api_key);
             CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
         """)
+
+        # Try to create user key indexes (may fail if column name differs, that's OK)
+        for stmt in [
+            f"CREATE INDEX IF NOT EXISTS idx_agents_user ON agents({USER_KEY_COL})",
+            f"CREATE INDEX IF NOT EXISTS idx_knowledge_user ON knowledge({USER_KEY_COL})",
+            f"CREATE INDEX IF NOT EXISTS idx_schedules_user ON schedules({USER_KEY_COL})",
+        ]:
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
+
         conn.commit()
-        logger.info("✅ Database initialized")
+        logger.info(f"✅ Database initialized (key column: {USER_KEY_COL})")
     finally:
         conn.close()
 
@@ -298,7 +337,7 @@ def get_knowledge_for_agent(user_api_key: str, agent_type: str, task: str = "") 
             return get_relevant_knowledge(conn, user_api_key, agent_type, task)
 
         rows = conn.execute(
-            "SELECT content FROM knowledge WHERE user_api_key = ? AND agent_type = ? ORDER BY created_at DESC LIMIT 10",
+            f"SELECT content FROM knowledge WHERE {USER_KEY_COL} = ? AND agent_type = ? ORDER BY created_at DESC LIMIT 10",
             (user_api_key, agent_type),
         ).fetchall()
         if not rows:
@@ -413,7 +452,7 @@ async def scheduler_loop():
             conn = get_db()
             try:
                 rows = conn.execute(
-                    "SELECT id, user_api_key, agent_type, task_description, cron_expression, schedule_type, pipeline_id, collab_id FROM schedules WHERE enabled = 1"
+                    f"SELECT id, {USER_KEY_COL}, agent_type, task_description, cron_expression, schedule_type, pipeline_id, collab_id FROM schedules WHERE enabled = 1"
                 ).fetchall()
             finally:
                 conn.close()
@@ -460,7 +499,7 @@ async def scheduler_loop():
                         conn = get_db()
                         try:
                             conn.execute(
-                                "INSERT INTO agents (id, user_api_key, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+                                f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
                                 (agent_id, user_key, agent_type, f"[Scheduled] {task_desc}", now_str),
                             )
                             conn.commit()
@@ -534,7 +573,7 @@ async def handle_telegram_message(message: dict):
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO agents (id, user_api_key, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+            f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
             (agent_id, user_key, agent_type, task, now),
         )
         conn.commit()
@@ -639,7 +678,7 @@ async def deploy_agent(req: DeployRequest, api_key: str = Depends(get_api_key)):
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO agents (id, user_api_key, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+            f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
             (agent_id, api_key, req.agent_type, req.task_description, now),
         )
         conn.commit()
@@ -662,7 +701,7 @@ async def get_status(agent_id: str, api_key: str = Depends(get_api_key)):
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT id, agent_type, task_description, status, result, created_at, completed_at FROM agents WHERE id = ? AND user_api_key = ?",
+            f"SELECT id, agent_type, task_description, status, result, created_at, completed_at FROM agents WHERE id = ? AND {USER_KEY_COL} = ?",
             (agent_id, api_key),
         ).fetchone()
     finally:
@@ -687,7 +726,7 @@ async def get_history(api_key: str = Depends(get_api_key), limit: int = 20):
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT id, agent_type, task_description, status, result, created_at, completed_at FROM agents WHERE user_api_key = ? ORDER BY created_at DESC LIMIT ?",
+            f"SELECT id, agent_type, task_description, status, result, created_at, completed_at FROM agents WHERE {USER_KEY_COL} = ? ORDER BY created_at DESC LIMIT ?",
             (api_key, limit),
         ).fetchall()
     finally:
@@ -711,7 +750,7 @@ async def add_knowledge(req: KnowledgeRequest, api_key: str = Depends(get_api_ke
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO knowledge (id, user_api_key, agent_type, content, domain, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            f"INSERT INTO knowledge (id, {USER_KEY_COL}, agent_type, content, domain, confidence, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (kid, api_key, req.agent_type, req.content, req.domain, req.confidence, now),
         )
         conn.commit()
@@ -726,12 +765,12 @@ async def list_knowledge(api_key: str = Depends(get_api_key), agent_type: str = 
     try:
         if agent_type:
             rows = conn.execute(
-                "SELECT id, agent_type, content, domain, confidence, created_at FROM knowledge WHERE user_api_key = ? AND agent_type = ? ORDER BY created_at DESC LIMIT 50",
+                f"SELECT id, agent_type, content, domain, confidence, created_at FROM knowledge WHERE {USER_KEY_COL} = ? AND agent_type = ? ORDER BY created_at DESC LIMIT 50",
                 (api_key, agent_type),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, agent_type, content, domain, confidence, created_at FROM knowledge WHERE user_api_key = ? ORDER BY created_at DESC LIMIT 50",
+                f"SELECT id, agent_type, content, domain, confidence, created_at FROM knowledge WHERE {USER_KEY_COL} = ? ORDER BY created_at DESC LIMIT 50",
                 (api_key,),
             ).fetchall()
     finally:
@@ -790,7 +829,7 @@ async def deploy_chain(req: ChainRequest, api_key: str = Depends(get_api_key)):
         conn = get_db()
         try:
             conn.execute(
-                "INSERT INTO agents (id, user_api_key, agent_type, task_description, status, result, created_at, completed_at) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)",
+                f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, result, created_at, completed_at) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)",
                 (chain_id, api_key, "chain", f"[Pipeline] {pipeline_name}: {req.task_description[:200]}", summary, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
@@ -860,7 +899,7 @@ async def deploy_collab(req: CollabRequest, api_key: str = Depends(get_api_key))
         conn = get_db()
         try:
             conn.execute(
-                "INSERT INTO agents (id, user_api_key, agent_type, task_description, status, result, created_at, completed_at) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)",
+                f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, result, created_at, completed_at) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?)",
                 (collab_id, api_key, "collab", f"[Collab] {collab_name}: {req.task_description[:200]}", summary, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
@@ -897,7 +936,7 @@ async def create_schedule(req: ScheduleRequest, api_key: str = Depends(get_api_k
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO schedules (id, user_api_key, agent_type, task_description, cron_expression, schedule_type, pipeline_id, collab_id, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            f"INSERT INTO schedules (id, {USER_KEY_COL}, agent_type, task_description, cron_expression, schedule_type, pipeline_id, collab_id, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
             (sched_id, api_key, req.agent_type, req.task_description, cron_expr, req.schedule_type, req.pipeline_id, req.collab_id, now),
         )
         conn.commit()
@@ -917,7 +956,7 @@ async def list_schedules(api_key: str = Depends(get_api_key)):
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT id, agent_type, task_description, cron_expression, schedule_type, pipeline_id, collab_id, enabled, last_run, created_at FROM schedules WHERE user_api_key = ? ORDER BY created_at DESC",
+            f"SELECT id, agent_type, task_description, cron_expression, schedule_type, pipeline_id, collab_id, enabled, last_run, created_at FROM schedules WHERE {USER_KEY_COL} = ? ORDER BY created_at DESC",
             (api_key,),
         ).fetchall()
     finally:
@@ -939,7 +978,7 @@ async def delete_schedule(schedule_id: str, api_key: str = Depends(get_api_key))
     conn = get_db()
     try:
         cursor = conn.execute(
-            "DELETE FROM schedules WHERE id = ? AND user_api_key = ?",
+            f"DELETE FROM schedules WHERE id = ? AND {USER_KEY_COL} = ?",
             (schedule_id, api_key),
         )
         conn.commit()
@@ -955,7 +994,7 @@ async def toggle_schedule(schedule_id: str, api_key: str = Depends(get_api_key))
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT enabled FROM schedules WHERE id = ? AND user_api_key = ?",
+            f"SELECT enabled FROM schedules WHERE id = ? AND {USER_KEY_COL} = ?",
             (schedule_id, api_key),
         ).fetchone()
         if not row:
