@@ -44,7 +44,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "apex_swarm.db")
 PORT = int(os.getenv("PORT", "8080"))
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 # ─── OPTIONAL MODULE IMPORTS (graceful degradation) ───────
 
@@ -205,105 +205,470 @@ for cat_name, cat_data in AGENT_CATEGORIES.items():
         AGENT_TO_CATEGORY[agent_id] = cat_name
 
 
-# ─── DATABASE ─────────────────────────────────────────────
+# ─── DATABASE (PostgreSQL with SQLite fallback) ──────────
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        logger.info("✅ PostgreSQL driver loaded")
+    except ImportError:
+        USE_POSTGRES = False
+        logger.warning("⚠️ psycopg2 not installed — falling back to SQLite")
+
 
 def get_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    else:
+        conn = sqlite3.connect(DATABASE_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
 
-def _get_columns(conn, table: str) -> list[str]:
-    """Get column names for a table."""
-    try:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-        return [r[1] for r in rows]
-    except Exception:
-        return []
+def db_execute(conn, sql, params=None):
+    """Execute SQL compatible with both SQLite and Postgres."""
+    if USE_POSTGRES:
+        # Convert ? placeholders to %s for Postgres
+        sql = sql.replace("?", "%s")
+        # Convert INTEGER DEFAULT to compatible syntax
+        cur = conn.cursor()
+        cur.execute(sql, params or ())
+        return cur
+    else:
+        return conn.execute(sql, params or ())
 
 
-# Detect which column name the DB uses for the user key.
-# v2.1 used "api_key", v3.0 uses "user_api_key". We adapt to whatever exists.
-USER_KEY_COL = "user_api_key"  # default for fresh installs
+def db_fetchone(conn, sql, params=None):
+    cur = db_execute(conn, sql, params)
+    return cur.fetchone()
+
+
+def db_fetchall(conn, sql, params=None):
+    cur = db_execute(conn, sql, params)
+    return cur.fetchall()
+
+
+USER_KEY_COL = "user_api_key"
 
 
 def init_db():
     global USER_KEY_COL
+    USER_KEY_COL = "user_api_key"
     conn = get_db()
     try:
-        # Check if agents table exists and which column name it uses
-        existing_cols = _get_columns(conn, "agents")
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            # PostgreSQL schema
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS agents (
+                    id TEXT PRIMARY KEY,
+                    user_api_key TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    task_description TEXT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    result TEXT,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    cost_usd REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
 
-        if existing_cols:
-            # Table exists — detect column name
-            if "api_key" in existing_cols and "user_api_key" not in existing_cols:
-                USER_KEY_COL = "api_key"
-                logger.info("📦 Detected v2.1 schema (api_key column) — adapting")
-            else:
-                USER_KEY_COL = "user_api_key"
+                CREATE TABLE IF NOT EXISTS knowledge (
+                    id TEXT PRIMARY KEY,
+                    user_api_key TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    domain TEXT DEFAULT 'general',
+                    confidence REAL DEFAULT 0.8,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id TEXT PRIMARY KEY,
+                    user_api_key TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    task_description TEXT NOT NULL,
+                    cron_expression TEXT NOT NULL,
+                    schedule_type TEXT DEFAULT 'single',
+                    pipeline_id TEXT,
+                    collab_id TEXT,
+                    enabled INTEGER DEFAULT 1,
+                    last_run TEXT,
+                    next_run TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS daemon_configs (
+                    id TEXT PRIMARY KEY,
+                    user_api_key TEXT NOT NULL,
+                    preset_id TEXT,
+                    agent_type TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    task_description TEXT NOT NULL,
+                    interval_seconds INTEGER DEFAULT 300,
+                    max_cycles INTEGER DEFAULT 0,
+                    alert_conditions TEXT DEFAULT '[]',
+                    enabled INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS licenses (
+                    license_key TEXT PRIMARY KEY,
+                    email TEXT,
+                    product_id TEXT,
+                    tier TEXT DEFAULT 'starter',
+                    uses_count INTEGER DEFAULT 0,
+                    max_agents INTEGER DEFAULT 5,
+                    max_daemons INTEGER DEFAULT 1,
+                    active INTEGER DEFAULT 1,
+                    validated_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    id TEXT PRIMARY KEY,
+                    user_api_key TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    cost_usd REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL
+                );
+            """)
+            # Indexes
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_agents_user ON agents(user_api_key)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)",
+                "CREATE INDEX IF NOT EXISTS idx_knowledge_user ON knowledge(user_api_key)",
+                "CREATE INDEX IF NOT EXISTS idx_schedules_user ON schedules(user_api_key)",
+                "CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled)",
+                "CREATE INDEX IF NOT EXISTS idx_daemon_configs_user ON daemon_configs(user_api_key)",
+                "CREATE INDEX IF NOT EXISTS idx_usage_log_user ON usage_log(user_api_key)",
+                "CREATE INDEX IF NOT EXISTS idx_usage_log_created ON usage_log(created_at)",
+                "CREATE INDEX IF NOT EXISTS idx_licenses_active ON licenses(active)",
+            ]:
+                try:
+                    cur.execute(idx_sql)
+                except Exception:
+                    pass
+            conn.commit()
+            logger.info("✅ PostgreSQL database initialized")
         else:
-            # Fresh install — create with v3 schema
-            USER_KEY_COL = "user_api_key"
-
-        # Create tables if they don't exist (fresh install)
-        conn.executescript(f"""
-            CREATE TABLE IF NOT EXISTS agents (
-                id TEXT PRIMARY KEY,
-                {USER_KEY_COL} TEXT NOT NULL,
-                agent_type TEXT NOT NULL,
-                task_description TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                result TEXT,
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS knowledge (
-                id TEXT PRIMARY KEY,
-                {USER_KEY_COL} TEXT NOT NULL,
-                agent_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                domain TEXT DEFAULT 'general',
-                confidence REAL DEFAULT 0.8,
-                access_count INTEGER DEFAULT 0,
-                last_accessed TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS schedules (
-                id TEXT PRIMARY KEY,
-                {USER_KEY_COL} TEXT NOT NULL,
-                agent_type TEXT NOT NULL,
-                task_description TEXT NOT NULL,
-                cron_expression TEXT NOT NULL,
-                schedule_type TEXT DEFAULT 'single',
-                pipeline_id TEXT,
-                collab_id TEXT,
-                enabled INTEGER DEFAULT 1,
-                last_run TEXT,
-                next_run TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
-            CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
-        """)
-
-        # Try to create user key indexes (may fail if column name differs, that's OK)
-        for stmt in [
-            f"CREATE INDEX IF NOT EXISTS idx_agents_user ON agents({USER_KEY_COL})",
-            f"CREATE INDEX IF NOT EXISTS idx_knowledge_user ON knowledge({USER_KEY_COL})",
-            f"CREATE INDEX IF NOT EXISTS idx_schedules_user ON schedules({USER_KEY_COL})",
-        ]:
+            # SQLite fallback — detect old schema
             try:
-                conn.execute(stmt)
+                rows = conn.execute("PRAGMA table_info(agents)").fetchall()
+                existing_cols = [r[1] for r in rows]
+                if "api_key" in existing_cols and "user_api_key" not in existing_cols:
+                    USER_KEY_COL = "api_key"
+                    logger.info("📦 Detected v2.1 schema (api_key column)")
             except Exception:
                 pass
 
-        conn.commit()
-        logger.info(f"✅ Database initialized (key column: {USER_KEY_COL})")
+            conn.executescript(f"""
+                CREATE TABLE IF NOT EXISTS agents (
+                    id TEXT PRIMARY KEY,
+                    {USER_KEY_COL} TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    task_description TEXT NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    result TEXT,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    cost_usd REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS knowledge (
+                    id TEXT PRIMARY KEY,
+                    {USER_KEY_COL} TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    domain TEXT DEFAULT 'general',
+                    confidence REAL DEFAULT 0.8,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id TEXT PRIMARY KEY,
+                    {USER_KEY_COL} TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    task_description TEXT NOT NULL,
+                    cron_expression TEXT NOT NULL,
+                    schedule_type TEXT DEFAULT 'single',
+                    pipeline_id TEXT,
+                    collab_id TEXT,
+                    enabled INTEGER DEFAULT 1,
+                    last_run TEXT,
+                    next_run TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS daemon_configs (
+                    id TEXT PRIMARY KEY,
+                    {USER_KEY_COL} TEXT NOT NULL,
+                    preset_id TEXT,
+                    agent_type TEXT NOT NULL,
+                    agent_name TEXT NOT NULL,
+                    task_description TEXT NOT NULL,
+                    interval_seconds INTEGER DEFAULT 300,
+                    max_cycles INTEGER DEFAULT 0,
+                    alert_conditions TEXT DEFAULT '[]',
+                    enabled INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS licenses (
+                    license_key TEXT PRIMARY KEY,
+                    email TEXT,
+                    product_id TEXT,
+                    tier TEXT DEFAULT 'starter',
+                    uses_count INTEGER DEFAULT 0,
+                    max_agents INTEGER DEFAULT 5,
+                    max_daemons INTEGER DEFAULT 1,
+                    active INTEGER DEFAULT 1,
+                    validated_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS usage_log (
+                    id TEXT PRIMARY KEY,
+                    {USER_KEY_COL} TEXT NOT NULL,
+                    agent_type TEXT NOT NULL,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    cost_usd REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+                CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
+            """)
+
+            for stmt in [
+                f"CREATE INDEX IF NOT EXISTS idx_agents_user ON agents({USER_KEY_COL})",
+                f"CREATE INDEX IF NOT EXISTS idx_knowledge_user ON knowledge({USER_KEY_COL})",
+                f"CREATE INDEX IF NOT EXISTS idx_schedules_user ON schedules({USER_KEY_COL})",
+                f"CREATE INDEX IF NOT EXISTS idx_daemon_configs_user ON daemon_configs({USER_KEY_COL})",
+                f"CREATE INDEX IF NOT EXISTS idx_usage_log_user ON usage_log({USER_KEY_COL})",
+            ]:
+                try:
+                    conn.execute(stmt)
+                except Exception:
+                    pass
+
+            conn.commit()
+            logger.info(f"✅ SQLite database initialized (key column: {USER_KEY_COL})")
     finally:
         conn.close()
+
+
+# ─── COST TRACKING ────────────────────────────────────────
+
+# Haiku 4.5 pricing (per 1M tokens)
+COST_PER_1M_INPUT = 0.80
+COST_PER_1M_OUTPUT = 4.00
+
+
+def calculate_cost(input_tokens: int, output_tokens: int) -> float:
+    return (input_tokens * COST_PER_1M_INPUT / 1_000_000) + (output_tokens * COST_PER_1M_OUTPUT / 1_000_000)
+
+
+def log_usage(user_api_key: str, agent_type: str, input_tokens: int, output_tokens: int, agent_id: str = None):
+    """Log token usage and cost."""
+    cost = calculate_cost(input_tokens, output_tokens)
+    conn = get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        uid = str(uuid.uuid4())
+        db_execute(conn,
+            f"INSERT INTO usage_log (id, {USER_KEY_COL}, agent_type, input_tokens, output_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (uid, user_api_key, agent_type, input_tokens, output_tokens, cost, now),
+        )
+        # Update agent record if we have the ID
+        if agent_id:
+            db_execute(conn,
+                "UPDATE agents SET input_tokens = ?, output_tokens = ?, cost_usd = ? WHERE id = ?",
+                (input_tokens, output_tokens, cost, agent_id),
+            )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Usage logging failed: {e}")
+    finally:
+        conn.close()
+    return cost
+
+
+# ─── GUMROAD LICENSE VALIDATION ──────────────────────────
+
+GUMROAD_PRODUCT_ID = os.getenv("GUMROAD_PRODUCT_ID", "")
+
+# Tier limits
+TIER_LIMITS = {
+    "free": {"max_agents_per_day": 3, "max_daemons": 0, "max_schedules": 0, "tools": False},
+    "starter": {"max_agents_per_day": 25, "max_daemons": 1, "max_schedules": 3, "tools": True},
+    "pro": {"max_agents_per_day": 100, "max_daemons": 5, "max_schedules": 10, "tools": True},
+    "enterprise": {"max_agents_per_day": 9999, "max_daemons": 50, "max_schedules": 100, "tools": True},
+    "admin": {"max_agents_per_day": 99999, "max_daemons": 999, "max_schedules": 999, "tools": True},
+}
+
+
+async def validate_gumroad_license(license_key: str) -> dict:
+    """Validate a license key against Gumroad API."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.gumroad.com/v2/licenses/verify",
+                data={
+                    "product_id": GUMROAD_PRODUCT_ID,
+                    "license_key": license_key,
+                    "increment_uses_count": "false",
+                },
+            )
+        if resp.status_code != 200:
+            return {"valid": False, "error": "Gumroad API error"}
+
+        data = resp.json()
+        if not data.get("success"):
+            return {"valid": False, "error": data.get("message", "Invalid license")}
+
+        purchase = data.get("purchase", {})
+        email = purchase.get("email", "")
+        variants = purchase.get("variants", "")
+        uses = data.get("uses", 0)
+
+        # Determine tier from Gumroad variant or default to starter
+        tier = "starter"
+        if "pro" in variants.lower():
+            tier = "pro"
+        elif "enterprise" in variants.lower():
+            tier = "enterprise"
+
+        return {"valid": True, "email": email, "tier": tier, "uses": uses}
+    except Exception as e:
+        logger.error(f"Gumroad validation error: {e}")
+        return {"valid": False, "error": str(e)}
+
+
+async def get_or_validate_license(license_key: str) -> dict:
+    """Check DB cache first, then validate with Gumroad."""
+    conn = get_db()
+    try:
+        row = db_fetchone(conn, "SELECT license_key, email, tier, active, validated_at FROM licenses WHERE license_key = ?", (license_key,))
+        if row and row[3]:  # active
+            return {"valid": True, "email": row[1], "tier": row[2], "cached": True}
+    finally:
+        conn.close()
+
+    # Not cached or inactive — validate with Gumroad
+    if not GUMROAD_PRODUCT_ID:
+        # No Gumroad configured — accept any key as starter (dev mode)
+        return {"valid": True, "email": "", "tier": "starter", "dev_mode": True}
+
+    result = await validate_gumroad_license(license_key)
+    if result["valid"]:
+        # Cache the validated license
+        conn = get_db()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            db_execute(conn,
+                "INSERT INTO licenses (license_key, email, product_id, tier, active, validated_at, created_at) VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(license_key) DO UPDATE SET active = 1, tier = ?, validated_at = ?",
+                (license_key, result["email"], GUMROAD_PRODUCT_ID, result["tier"], now, now, result["tier"], now),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"License caching failed: {e}")
+        finally:
+            conn.close()
+
+    return result
+
+
+def check_tier_limit(tier: str, limit_type: str, current_count: int) -> bool:
+    """Check if user is within their tier limits."""
+    limits = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
+    max_val = limits.get(limit_type, 0)
+    return current_count < max_val
+
+
+# ─── DAEMON PERSISTENCE ──────────────────────────────────
+
+def save_daemon_config(daemon_id: str, user_api_key: str, preset_id: str, agent_type: str, agent_name: str,
+                        task_description: str, interval_seconds: int, max_cycles: int, alert_conditions: list):
+    """Save daemon config to DB for restart persistence."""
+    conn = get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        db_execute(conn,
+            f"INSERT INTO daemon_configs (id, {USER_KEY_COL}, preset_id, agent_type, agent_name, task_description, interval_seconds, max_cycles, alert_conditions, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (daemon_id, user_api_key, preset_id or "", agent_type, agent_name, task_description, interval_seconds, max_cycles, json.dumps(alert_conditions), now),
+        )
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Daemon config save failed: {e}")
+    finally:
+        conn.close()
+
+
+def remove_daemon_config(daemon_id: str):
+    """Remove daemon config from DB."""
+    conn = get_db()
+    try:
+        db_execute(conn, "UPDATE daemon_configs SET enabled = 0 WHERE id = ?", (daemon_id,))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Daemon config removal failed: {e}")
+    finally:
+        conn.close()
+
+
+async def restore_daemons():
+    """Restart enabled daemons from DB after deploy."""
+    if not MISSION_CONTROL:
+        return
+    conn = get_db()
+    try:
+        rows = db_fetchall(conn,
+            f"SELECT id, {USER_KEY_COL}, preset_id, agent_type, agent_name, task_description, interval_seconds, max_cycles, alert_conditions FROM daemon_configs WHERE enabled = 1"
+        )
+    finally:
+        conn.close()
+
+    if not rows:
+        return
+
+    logger.info(f"🔄 Restoring {len(rows)} daemon(s) from database...")
+    for row in rows:
+        did, user_key, preset_id, agent_type, agent_name, task_desc, interval, max_cyc, alert_json = row
+        try:
+            alerts = json.loads(alert_json) if alert_json else []
+        except Exception:
+            alerts = []
+        try:
+            await daemon_manager.start_daemon(
+                agent_type=agent_type,
+                agent_name=agent_name,
+                task_description=task_desc,
+                execute_fn=_daemon_execute_fn,
+                interval_seconds=interval,
+                max_cycles=max_cyc,
+                alert_conditions=alerts,
+                user_api_key=user_key,
+            )
+            logger.info(f"  ✅ Restored daemon: {agent_name} ({did[:8]})")
+        except Exception as e:
+            logger.error(f"  ❌ Failed to restore daemon {did[:8]}: {e}")
 
 
 # ─── PYDANTIC MODELS ─────────────────────────────────────
@@ -340,14 +705,37 @@ class ScheduleRequest(BaseModel):
 
 # ─── AUTH ─────────────────────────────────────────────────
 
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+
 def get_api_key(x_api_key: str = Header(None), authorization: str = Header(None)) -> str:
-    """Extract API key from headers. Accepts any non-empty key for now."""
+    """Extract API key from headers."""
     key = x_api_key or ""
     if not key and authorization:
         key = authorization.replace("Bearer ", "")
     if not key:
         raise HTTPException(status_code=401, detail="API key required. Pass X-Api-Key header.")
     return key
+
+
+async def get_validated_user(x_api_key: str = Header(None), authorization: str = Header(None)) -> dict:
+    """Validate API key and return user info with tier."""
+    key = x_api_key or ""
+    if not key and authorization:
+        key = authorization.replace("Bearer ", "")
+    if not key:
+        raise HTTPException(status_code=401, detail="API key required.")
+
+    # Admin bypass
+    if ADMIN_API_KEY and key == ADMIN_API_KEY:
+        return {"api_key": key, "tier": "admin", "email": "admin"}
+
+    # Validate license
+    result = await get_or_validate_license(key)
+    if not result.get("valid"):
+        raise HTTPException(status_code=403, detail=result.get("error", "Invalid license key"))
+
+    return {"api_key": key, "tier": result.get("tier", "starter"), "email": result.get("email", "")}
 
 
 # ─── KNOWLEDGE RETRIEVAL ─────────────────────────────────
@@ -810,8 +1198,13 @@ async def lifespan(app: FastAPI):
         event_bus.set_telegram(send_fn=send_telegram, verbosity="important")
         logger.info("📡 Event bus → Telegram forwarding active")
 
-    logger.info(f"🚀 APEX SWARM v{VERSION} starting")
+    # Restore persistent daemons
+    await restore_daemons()
+
+    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
+    logger.info(f"🚀 APEX SWARM v{VERSION} starting ({db_type})")
     logger.info(f"   Tools: {'✅' if TOOLS_AVAILABLE else '❌'} | Chains: {'✅' if CHAINS_AVAILABLE else '❌'} | Knowledge: {'✅' if SMART_KNOWLEDGE else '❌'} | Mission Control: {'✅' if MISSION_CONTROL else '❌'}")
+    logger.info(f"   Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
     yield
     scheduler_task.cancel()
     try:
@@ -846,6 +1239,8 @@ async def health():
         "smart_knowledge": SMART_KNOWLEDGE,
         "mission_control": MISSION_CONTROL,
         "telegram": TELEGRAM_ENABLED,
+        "database": "postgresql" if USE_POSTGRES else "sqlite",
+        "auth": "gumroad" if GUMROAD_PRODUCT_ID else "dev_mode",
     }
 
 
@@ -946,6 +1341,58 @@ async def god_eye_status():
     }
 
 
+# ─── USAGE & COST ENDPOINTS ──────────────────────────────
+
+@app.get("/api/v1/usage")
+async def get_usage(api_key: str = Depends(get_api_key), days: int = 30):
+    """Get token usage and cost summary."""
+    conn = get_db()
+    try:
+        # Total usage
+        row = db_fetchone(conn,
+            f"SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0), COUNT(*) FROM usage_log WHERE {USER_KEY_COL} = ?",
+            (api_key,),
+        )
+        total_input, total_output, total_cost, total_calls = row if row else (0, 0, 0, 0)
+
+        # Per-agent breakdown
+        rows = db_fetchall(conn,
+            f"SELECT agent_type, SUM(input_tokens), SUM(output_tokens), SUM(cost_usd), COUNT(*) FROM usage_log WHERE {USER_KEY_COL} = ? GROUP BY agent_type ORDER BY SUM(cost_usd) DESC LIMIT 20",
+            (api_key,),
+        )
+        by_agent = [
+            {"agent_type": r[0], "input_tokens": r[1], "output_tokens": r[2], "cost_usd": round(r[3], 6), "calls": r[4]}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+    return {
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_cost_usd": round(total_cost, 6),
+        "total_calls": total_calls,
+        "by_agent": by_agent,
+    }
+
+
+@app.post("/api/v1/license/validate")
+async def validate_license(request: Request):
+    """Validate a Gumroad license key."""
+    data = await request.json()
+    key = data.get("license_key", "")
+    if not key:
+        raise HTTPException(status_code=400, detail="license_key required")
+
+    result = await get_or_validate_license(key)
+    if result.get("valid"):
+        tier = result.get("tier", "starter")
+        limits = TIER_LIMITS.get(tier, TIER_LIMITS["starter"])
+        return {"valid": True, "tier": tier, "email": result.get("email", ""), "limits": limits}
+    else:
+        return {"valid": False, "error": result.get("error", "Invalid license")}
+
+
 # ─── DAEMON ENDPOINTS ────────────────────────────────────
 
 class DaemonRequest(BaseModel):
@@ -965,16 +1412,19 @@ async def start_daemon(req: DaemonRequest, api_key: str = Depends(get_api_key)):
 
     if req.preset_id and req.preset_id in DAEMON_PRESETS:
         preset = DAEMON_PRESETS[req.preset_id]
+        task_desc = req.task_description or preset["task_description"]
         daemon_id = await daemon_manager.start_daemon(
             agent_type=preset["agent_type"],
             agent_name=preset["name"],
-            task_description=req.task_description or preset["task_description"],
+            task_description=task_desc,
             execute_fn=_daemon_execute_fn,
             interval_seconds=preset["interval_seconds"],
             alert_conditions=preset.get("alert_conditions", []),
             user_api_key=api_key,
         )
-        return {"daemon_id": daemon_id, "name": preset["name"], "status": "running"}
+        save_daemon_config(daemon_id, api_key, req.preset_id, preset["agent_type"], preset["name"],
+                           task_desc, preset["interval_seconds"], 0, preset.get("alert_conditions", []))
+        return {"daemon_id": daemon_id, "name": preset["name"], "status": "running", "persistent": True}
     elif req.task_description:
         daemon_id = await daemon_manager.start_daemon(
             agent_type=req.agent_type,
@@ -986,7 +1436,9 @@ async def start_daemon(req: DaemonRequest, api_key: str = Depends(get_api_key)):
             alert_conditions=req.alert_conditions,
             user_api_key=api_key,
         )
-        return {"daemon_id": daemon_id, "name": req.agent_name, "status": "running"}
+        save_daemon_config(daemon_id, api_key, "", req.agent_type, req.agent_name,
+                           req.task_description, req.interval_seconds, req.max_cycles, req.alert_conditions)
+        return {"daemon_id": daemon_id, "name": req.agent_name, "status": "running", "persistent": True}
     else:
         raise HTTPException(status_code=400, detail="Provide preset_id or task_description")
 
@@ -1021,6 +1473,7 @@ async def stop_daemon(daemon_id: str, api_key: str = Depends(get_api_key)):
     if not found:
         raise HTTPException(status_code=404, detail="Daemon not found")
     await daemon_manager.stop_daemon(found)
+    remove_daemon_config(found)
     return {"status": "stopped", "daemon_id": found}
 
 
