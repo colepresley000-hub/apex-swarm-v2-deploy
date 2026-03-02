@@ -44,7 +44,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "apex_swarm.db")
 PORT = int(os.getenv("PORT", "8080"))
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 # ─── OPTIONAL MODULE IMPORTS (graceful degradation) ───────
 
@@ -84,6 +84,30 @@ except ImportError:
     daemon_manager = None
     DAEMON_PRESETS = {}
     logger.warning("⚠️ mission_control not found — no real-time events")
+
+# Swarm memory
+SWARM_MEMORY = False
+swarm_memory = None
+try:
+    from swarm_memory import SwarmMemory
+    SWARM_MEMORY = True
+    logger.info("✅ swarm_memory loaded — agents share knowledge")
+except ImportError:
+    logger.warning("⚠️ swarm_memory not found — no shared agent memory")
+
+# MCP registry + rate limiter
+MCP_AVAILABLE = False
+mcp_registry = None
+rate_limiter = None
+tier_enforcer = None
+try:
+    from mcp_registry import MCPRegistry, RateLimiter, TierEnforcer, MCP_TEMPLATES, rate_limiter as _rl
+    MCP_AVAILABLE = True
+    rate_limiter = _rl
+    logger.info("✅ mcp_registry loaded — dynamic tools, rate limiting active")
+except ImportError:
+    MCP_TEMPLATES = {}
+    logger.warning("⚠️ mcp_registry not found — no dynamic tools or rate limiting")
 
 # Smart knowledge (optional)
 SMART_KNOWLEDGE = False
@@ -473,6 +497,33 @@ def init_db():
     finally:
         conn.close()
 
+    # Initialize swarm memory tables
+    if SWARM_MEMORY:
+        global swarm_memory
+        swarm_memory = SwarmMemory(get_db, db_execute, db_fetchall, db_fetchone, USER_KEY_COL)
+        conn = get_db()
+        try:
+            swarm_memory.init_tables(conn)
+            logger.info("✅ Swarm memory tables initialized")
+        except Exception as e:
+            logger.error(f"Swarm memory init failed: {e}")
+        finally:
+            conn.close()
+
+    # Initialize MCP registry tables
+    if MCP_AVAILABLE:
+        global mcp_registry, tier_enforcer
+        mcp_registry = MCPRegistry(get_db, db_execute, db_fetchall, db_fetchone, USER_KEY_COL)
+        tier_enforcer = TierEnforcer(get_db, db_fetchone, USER_KEY_COL)
+        conn = get_db()
+        try:
+            mcp_registry.init_tables(conn)
+            logger.info("✅ MCP registry tables initialized")
+        except Exception as e:
+            logger.error(f"MCP registry init failed: {e}")
+        finally:
+            conn.close()
+
 
 # ─── COST TRACKING ────────────────────────────────────────
 
@@ -794,6 +845,26 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
     if knowledge:
         system_prompt += knowledge
 
+    # Inject swarm memory (shared knowledge from other agents)
+    if SWARM_MEMORY and swarm_memory:
+        try:
+            memories = await swarm_memory.query(task_description, user_api_key=user_api_key, limit=3)
+            memory_context = swarm_memory.format_for_prompt(memories)
+            if memory_context:
+                system_prompt += memory_context
+        except Exception as e:
+            logger.error(f"Swarm memory query failed: {e}")
+
+    # Inject MCP tool context
+    if MCP_AVAILABLE and mcp_registry:
+        try:
+            user_tools = await mcp_registry.get_tools(user_api_key, category=category)
+            tool_context = mcp_registry.get_tool_definitions_for_claude(user_tools)
+            if tool_context:
+                system_prompt += tool_context
+        except Exception as e:
+            logger.error(f"MCP tool context failed: {e}")
+
     try:
         if TOOLS_AVAILABLE:
             tools = get_tools_for_agent(category)
@@ -848,6 +919,19 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
                 message="Task completed",
                 data={"result_preview": result[:300] if result else ""},
             ))
+
+        # Store result in swarm memory
+        if SWARM_MEMORY and swarm_memory and result:
+            try:
+                await swarm_memory.auto_extract_and_store(
+                    result=result,
+                    agent_type=agent_type,
+                    agent_name=agent["name"],
+                    task_description=task_description,
+                    user_api_key=user_api_key,
+                )
+            except Exception as e:
+                logger.error(f"Swarm memory store failed: {e}")
 
         return result
 
@@ -1204,6 +1288,7 @@ async def lifespan(app: FastAPI):
     db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
     logger.info(f"🚀 APEX SWARM v{VERSION} starting ({db_type})")
     logger.info(f"   Tools: {'✅' if TOOLS_AVAILABLE else '❌'} | Chains: {'✅' if CHAINS_AVAILABLE else '❌'} | Knowledge: {'✅' if SMART_KNOWLEDGE else '❌'} | Mission Control: {'✅' if MISSION_CONTROL else '❌'}")
+    logger.info(f"   Memory: {'✅' if SWARM_MEMORY else '❌'} | MCP: {'✅' if MCP_AVAILABLE else '❌'} | Rate Limit: {'✅' if rate_limiter else '❌'}")
     logger.info(f"   Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
     yield
     scheduler_task.cancel()
@@ -1241,6 +1326,9 @@ async def health():
         "telegram": TELEGRAM_ENABLED,
         "database": "postgresql" if USE_POSTGRES else "sqlite",
         "auth": "gumroad" if GUMROAD_PRODUCT_ID else "dev_mode",
+        "swarm_memory": SWARM_MEMORY,
+        "mcp_registry": MCP_AVAILABLE,
+        "rate_limiting": rate_limiter is not None,
     }
 
 
@@ -1498,12 +1586,19 @@ async def deploy_agent(req: DeployRequest, api_key: str = Depends(get_api_key)):
     if req.agent_type not in AGENTS:
         raise HTTPException(status_code=400, detail=f"Unknown agent: {req.agent_type}")
 
+    # Rate limit check
+    if rate_limiter:
+        check = rate_limiter.check(api_key, "starter")  # TODO: get tier from validated user
+        if not check["allowed"]:
+            raise HTTPException(status_code=429, detail=check["message"])
+        rate_limiter.consume(api_key, "starter")
+
     agent_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
     conn = get_db()
     try:
-        conn.execute(
+        db_execute(conn,
             f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
             (agent_id, api_key, req.agent_type, req.task_description, now),
         )
@@ -1741,6 +1836,103 @@ async def deploy_collab(req: CollabRequest, api_key: str = Depends(get_api_key))
         "status": "running",
         "message": f"Collaboration deployed. Poll /api/v1/status/{collab_id} for results.",
     }
+
+
+# ─── MCP TOOL ENDPOINTS ──────────────────────────────────
+
+class MCPToolRequest(BaseModel):
+    name: str
+    description: str
+    endpoint_url: str
+    method: str = "GET"
+    headers: dict = {}
+    body_template: str = ""
+    query_params: dict = {}
+    auth_type: str = "none"
+    auth_value: str = ""
+    input_schema: dict = {}
+    category: str = "general"
+
+
+@app.post("/api/v1/mcp/tools")
+async def register_mcp_tool(req: MCPToolRequest, api_key: str = Depends(get_api_key)):
+    if not MCP_AVAILABLE or not mcp_registry:
+        raise HTTPException(status_code=503, detail="MCP registry not loaded")
+    result = await mcp_registry.register_tool(
+        user_api_key=api_key, name=req.name, description=req.description,
+        endpoint_url=req.endpoint_url, method=req.method, headers=req.headers,
+        body_template=req.body_template, query_params=req.query_params,
+        auth_type=req.auth_type, auth_value=req.auth_value,
+        input_schema=req.input_schema, category=req.category,
+    )
+    return result
+
+
+@app.get("/api/v1/mcp/tools")
+async def list_mcp_tools(api_key: str = Depends(get_api_key), category: str = None):
+    if not MCP_AVAILABLE or not mcp_registry:
+        return {"tools": []}
+    tools = await mcp_registry.get_tools(api_key, category=category)
+    return {"tools": tools}
+
+
+@app.post("/api/v1/mcp/tools/{tool_id}/execute")
+async def execute_mcp_tool(tool_id: str, request: Request, api_key: str = Depends(get_api_key)):
+    if not MCP_AVAILABLE or not mcp_registry:
+        raise HTTPException(status_code=503, detail="MCP registry not loaded")
+    data = await request.json()
+    result = await mcp_registry.execute_tool(tool_id, api_key, input_data=data)
+    return result
+
+
+@app.delete("/api/v1/mcp/tools/{tool_id}")
+async def delete_mcp_tool(tool_id: str, api_key: str = Depends(get_api_key)):
+    if not MCP_AVAILABLE or not mcp_registry:
+        raise HTTPException(status_code=503, detail="MCP registry not loaded")
+    await mcp_registry.delete_tool(tool_id, api_key)
+    return {"status": "deleted"}
+
+
+@app.get("/api/v1/mcp/templates")
+async def list_mcp_templates():
+    return {"templates": MCP_TEMPLATES}
+
+
+# ─── SWARM MEMORY ENDPOINTS ─────────────────────────────
+
+@app.get("/api/v1/memory")
+async def query_memory(q: str = "", namespace: str = None, limit: int = 5, api_key: str = Depends(get_api_key)):
+    if not SWARM_MEMORY or not swarm_memory:
+        return {"memories": [], "message": "Swarm memory not loaded"}
+    if not q:
+        return {"memories": [], "message": "Provide ?q= query parameter"}
+    memories = await swarm_memory.query(q, namespace=namespace, user_api_key=api_key, limit=limit)
+    return {"memories": memories, "count": len(memories)}
+
+
+@app.get("/api/v1/memory/stats")
+async def memory_stats(api_key: str = Depends(get_api_key)):
+    if not SWARM_MEMORY or not swarm_memory:
+        return {"stats": {}, "message": "Swarm memory not loaded"}
+    stats = await swarm_memory.get_stats(user_api_key=api_key)
+    return {"stats": stats}
+
+
+@app.post("/api/v1/memory/cleanup")
+async def memory_cleanup(api_key: str = Depends(get_api_key)):
+    if not SWARM_MEMORY or not swarm_memory:
+        raise HTTPException(status_code=503, detail="Swarm memory not loaded")
+    await swarm_memory.cleanup(user_api_key=api_key)
+    return {"status": "cleanup complete"}
+
+
+# ─── RATE LIMIT ENDPOINT ────────────────────────────────
+
+@app.get("/api/v1/rate-limit")
+async def check_rate_limit(api_key: str = Depends(get_api_key)):
+    if not rate_limiter:
+        return {"message": "Rate limiting not active"}
+    return rate_limiter.get_usage(api_key, "starter")
 
 
 # ─── SCHEDULE ENDPOINTS ──────────────────────────────────
