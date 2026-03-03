@@ -44,7 +44,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "apex_swarm.db")
 PORT = int(os.getenv("PORT", "8080"))
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 
 # ─── OPTIONAL MODULE IMPORTS (graceful degradation) ───────
 
@@ -53,7 +53,7 @@ CHAINS_AVAILABLE = False
 MISSION_CONTROL = False
 
 try:
-    from agent_tools import execute_with_tools, get_tools_for_agent
+    from agent_tools import execute_with_tools, get_tools_for_agent, set_mcp_registry, get_mcp_tool_definitions
     TOOLS_AVAILABLE = True
     logger.info("✅ agent_tools loaded — agents have real capabilities")
 except ImportError:
@@ -108,6 +108,17 @@ try:
 except ImportError:
     MCP_TEMPLATES = {}
     logger.warning("⚠️ mcp_registry not found — no dynamic tools or rate limiting")
+
+# Workflow engine
+WORKFLOWS_AVAILABLE = False
+workflow_engine = None
+try:
+    from workflow_engine import WorkflowEngine, WORKFLOW_TEMPLATES, TriggerType, ActionType
+    WORKFLOWS_AVAILABLE = True
+    logger.info("✅ workflow_engine loaded — trigger/condition/action automation active")
+except ImportError:
+    WORKFLOW_TEMPLATES = {}
+    logger.warning("⚠️ workflow_engine not found — no workflow automation")
 
 # Smart knowledge (optional)
 SMART_KNOWLEDGE = False
@@ -244,11 +255,47 @@ if USE_POSTGRES:
         logger.warning("⚠️ psycopg2 not installed — falling back to SQLite")
 
 
+class PgConnectionWrapper:
+    """Wraps psycopg2 connection to behave like SQLite (conn.execute returns cursor with fetchone/fetchall)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        # Convert ? to %s for Postgres
+        sql = sql.replace("?", "%s")
+        cur = self._conn.cursor()
+        cur.execute(sql, params or ())
+        return cur
+
+    def executescript(self, sql):
+        cur = self._conn.cursor()
+        cur.execute(sql)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    @property
+    def autocommit(self):
+        return self._conn.autocommit
+
+    @autocommit.setter
+    def autocommit(self, val):
+        self._conn.autocommit = val
+
+
 def get_db():
     if USE_POSTGRES:
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = False
-        return conn
+        raw = psycopg2.connect(DATABASE_URL)
+        raw.autocommit = False
+        return PgConnectionWrapper(raw)
     else:
         conn = sqlite3.connect(DATABASE_PATH)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -256,25 +303,17 @@ def get_db():
 
 
 def db_execute(conn, sql, params=None):
-    """Execute SQL compatible with both SQLite and Postgres."""
-    if USE_POSTGRES:
-        # Convert ? placeholders to %s for Postgres
-        sql = sql.replace("?", "%s")
-        # Convert INTEGER DEFAULT to compatible syntax
-        cur = conn.cursor()
-        cur.execute(sql, params or ())
-        return cur
-    else:
-        return conn.execute(sql, params or ())
+    """Execute SQL — wrapper handles Postgres compatibility."""
+    return conn.execute(sql, params or ())
 
 
 def db_fetchone(conn, sql, params=None):
-    cur = db_execute(conn, sql, params)
+    cur = conn.execute(sql, params or ())
     return cur.fetchone()
 
 
 def db_fetchall(conn, sql, params=None):
-    cur = db_execute(conn, sql, params)
+    cur = conn.execute(sql, params or ())
     return cur.fetchall()
 
 
@@ -287,9 +326,8 @@ def init_db():
     conn = get_db()
     try:
         if USE_POSTGRES:
-            cur = conn.cursor()
-            # PostgreSQL schema
-            cur.execute("""
+            # PostgreSQL schema — use executescript through wrapper
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS agents (
                     id TEXT PRIMARY KEY,
                     user_api_key TEXT NOT NULL,
@@ -381,7 +419,7 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_licenses_active ON licenses(active)",
             ]:
                 try:
-                    cur.execute(idx_sql)
+                    conn.execute(idx_sql)
                 except Exception:
                     pass
             conn.commit()
@@ -519,8 +557,24 @@ def init_db():
         try:
             mcp_registry.init_tables(conn)
             logger.info("✅ MCP registry tables initialized")
+            # Wire MCP into agent_tools for dynamic tool execution
+            if TOOLS_AVAILABLE:
+                set_mcp_registry(mcp_registry)
         except Exception as e:
             logger.error(f"MCP registry init failed: {e}")
+        finally:
+            conn.close()
+
+    # Initialize workflow engine tables
+    if WORKFLOWS_AVAILABLE:
+        global workflow_engine
+        workflow_engine = WorkflowEngine(get_db, db_execute, db_fetchall, db_fetchone, USER_KEY_COL)
+        conn = get_db()
+        try:
+            workflow_engine.init_tables(conn)
+            logger.info("✅ Workflow engine tables initialized")
+        except Exception as e:
+            logger.error(f"Workflow engine init failed: {e}")
         finally:
             conn.close()
 
@@ -866,6 +920,14 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
             logger.error(f"MCP tool context failed: {e}")
 
     try:
+        # Get user's MCP tools for this execution
+        user_mcp_tools = None
+        if MCP_AVAILABLE and mcp_registry:
+            try:
+                user_mcp_tools = await mcp_registry.get_tools(user_api_key)
+            except Exception:
+                pass
+
         if TOOLS_AVAILABLE:
             tools = get_tools_for_agent(category)
             result = await execute_with_tools(
@@ -875,6 +937,8 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
                 user_message=task_description,
                 tools=tools,
                 max_turns=5,
+                user_api_key=user_api_key,
+                mcp_tools=user_mcp_tools,
             )
         else:
             # Legacy single-call mode
@@ -933,6 +997,16 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
             except Exception as e:
                 logger.error(f"Swarm memory store failed: {e}")
 
+        # Trigger workflows on agent completion
+        if WORKFLOWS_AVAILABLE and workflow_engine:
+            try:
+                await workflow_engine.process_event("agent.completed", {
+                    "agent_type": agent_type, "agent_name": agent["name"],
+                    "message": result[:500] if result else "",
+                }, user_api_key)
+            except Exception as e:
+                logger.error(f"Workflow trigger failed: {e}")
+
         return result
 
     except Exception as e:
@@ -956,6 +1030,16 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
                 agent_name=agent.get("name", agent_type),
                 message=str(e)[:300],
             ))
+
+        # Trigger workflows on agent failure
+        if WORKFLOWS_AVAILABLE and workflow_engine:
+            try:
+                await workflow_engine.process_event("agent.failed", {
+                    "agent_type": agent_type, "agent_name": agent.get("name", agent_type),
+                    "message": str(e)[:300],
+                }, user_api_key)
+            except Exception:
+                pass
 
 
 # Wrapper for chains module (it expects execute_fn(agent_id, agent_type, prompt))
@@ -1285,10 +1369,76 @@ async def lifespan(app: FastAPI):
     # Restore persistent daemons
     await restore_daemons()
 
+    # Register workflow action handlers
+    if WORKFLOWS_AVAILABLE and workflow_engine:
+        async def _wf_deploy_agent(action, event_data, user_api_key):
+            agent_type = action.get("agent_type", "research")
+            # Support {variable} substitution from event data
+            for key, val in event_data.items():
+                if isinstance(val, str):
+                    agent_type = agent_type.replace(f"{{{key}}}", val)
+            task = action.get("task", "Analyze this: {message}")
+            for key, val in event_data.items():
+                if isinstance(val, str):
+                    task = task.replace(f"{{{key}}}", val)
+            if agent_type not in AGENTS:
+                agent_type = "research"
+            agent_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            conn = get_db()
+            try:
+                db_execute(conn,
+                    f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+                    (agent_id, user_api_key, agent_type, task, now))
+                conn.commit()
+            finally:
+                conn.close()
+            asyncio.create_task(execute_task(agent_id, agent_type, task, user_api_key))
+            return f"Deployed {agent_type} ({agent_id[:8]})"
+
+        async def _wf_send_telegram(action, event_data, user_api_key):
+            msg = action.get("message", "Workflow triggered")
+            for key, val in event_data.items():
+                if isinstance(val, str):
+                    msg = msg.replace(f"{{{key}}}", val)
+            # Send to all subscribed Telegram chats
+            if MISSION_CONTROL and event_bus._telegram_chat_ids:
+                for chat_id in event_bus._telegram_chat_ids:
+                    await send_telegram(chat_id, f"⚡ *Workflow*: {msg}")
+            return "Telegram sent"
+
+        async def _wf_call_mcp(action, event_data, user_api_key):
+            if not MCP_AVAILABLE or not mcp_registry:
+                return "MCP not available"
+            tool_id = action.get("tool_id", "")
+            input_data = action.get("input_data", {})
+            result = await mcp_registry.execute_tool(tool_id, user_api_key, input_data)
+            return str(result)[:300]
+
+        workflow_engine.register_action(ActionType.DEPLOY_AGENT, _wf_deploy_agent)
+        workflow_engine.register_action(ActionType.SEND_TELEGRAM, _wf_send_telegram)
+        workflow_engine.register_action(ActionType.CALL_MCP_TOOL, _wf_call_mcp)
+        logger.info("⚡ Workflow action handlers registered")
+
+        # Wire event bus → workflow engine
+        if MISSION_CONTROL:
+            async def _event_to_workflow(event):
+                """Route event bus events to workflow engine."""
+                event_data = {
+                    "agent_type": event.agent_type,
+                    "agent_name": event.agent_name,
+                    "message": event.message,
+                    "data": event.data,
+                }
+                # Process for all users (user_api_key=None means check all)
+                await workflow_engine.process_event(event.event_type, event_data)
+            event_bus.add_post_emit_hook(_event_to_workflow)
+            logger.info("📡 Event bus → Workflow engine connected")
+
     db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
     logger.info(f"🚀 APEX SWARM v{VERSION} starting ({db_type})")
     logger.info(f"   Tools: {'✅' if TOOLS_AVAILABLE else '❌'} | Chains: {'✅' if CHAINS_AVAILABLE else '❌'} | Knowledge: {'✅' if SMART_KNOWLEDGE else '❌'} | Mission Control: {'✅' if MISSION_CONTROL else '❌'}")
-    logger.info(f"   Memory: {'✅' if SWARM_MEMORY else '❌'} | MCP: {'✅' if MCP_AVAILABLE else '❌'} | Rate Limit: {'✅' if rate_limiter else '❌'}")
+    logger.info(f"   Memory: {'✅' if SWARM_MEMORY else '❌'} | MCP: {'✅' if MCP_AVAILABLE else '❌'} | Workflows: {'✅' if WORKFLOWS_AVAILABLE else '❌'} | Rate Limit: {'✅' if rate_limiter else '❌'}")
     logger.info(f"   Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
     yield
     scheduler_task.cancel()
@@ -1933,6 +2083,86 @@ async def check_rate_limit(api_key: str = Depends(get_api_key)):
     if not rate_limiter:
         return {"message": "Rate limiting not active"}
     return rate_limiter.get_usage(api_key, "starter")
+
+
+# ─── WORKFLOW ENDPOINTS ──────────────────────────────────
+
+class WorkflowRequest(BaseModel):
+    name: str
+    trigger_type: str
+    actions: list[dict]
+    description: str = ""
+    trigger_filter: dict = {}
+    conditions: list[dict] = []
+    template_id: Optional[str] = None
+
+
+@app.post("/api/v1/workflows")
+async def create_workflow(req: WorkflowRequest, api_key: str = Depends(get_api_key)):
+    if not WORKFLOWS_AVAILABLE or not workflow_engine:
+        raise HTTPException(status_code=503, detail="Workflow engine not loaded")
+
+    # If using template, override with template values
+    if req.template_id and req.template_id in WORKFLOW_TEMPLATES:
+        tmpl = WORKFLOW_TEMPLATES[req.template_id]
+        wf_id = await workflow_engine.create_workflow(
+            user_api_key=api_key,
+            name=req.name or tmpl["name"],
+            trigger_type=tmpl["trigger_type"],
+            actions=tmpl["actions"],
+            description=tmpl.get("description", ""),
+            trigger_filter=tmpl.get("trigger_filter"),
+            conditions=req.conditions,
+        )
+        return {"workflow_id": wf_id, "name": tmpl["name"], "status": "active"}
+
+    wf_id = await workflow_engine.create_workflow(
+        user_api_key=api_key,
+        name=req.name,
+        trigger_type=req.trigger_type,
+        actions=req.actions,
+        description=req.description,
+        trigger_filter=req.trigger_filter,
+        conditions=req.conditions,
+    )
+    return {"workflow_id": wf_id, "name": req.name, "status": "active"}
+
+
+@app.get("/api/v1/workflows")
+async def list_workflows(api_key: str = Depends(get_api_key)):
+    if not WORKFLOWS_AVAILABLE or not workflow_engine:
+        return {"workflows": []}
+    workflows = await workflow_engine.get_workflows(api_key)
+    return {"workflows": workflows}
+
+
+@app.get("/api/v1/workflows/templates")
+async def list_workflow_templates():
+    return {"templates": WORKFLOW_TEMPLATES}
+
+
+@app.delete("/api/v1/workflows/{wf_id}")
+async def delete_workflow(wf_id: str, api_key: str = Depends(get_api_key)):
+    if not WORKFLOWS_AVAILABLE or not workflow_engine:
+        raise HTTPException(status_code=503, detail="Workflow engine not loaded")
+    await workflow_engine.delete_workflow(wf_id, api_key)
+    return {"status": "deleted"}
+
+
+@app.post("/api/v1/workflows/{wf_id}/toggle")
+async def toggle_workflow(wf_id: str, api_key: str = Depends(get_api_key)):
+    if not WORKFLOWS_AVAILABLE or not workflow_engine:
+        raise HTTPException(status_code=503, detail="Workflow engine not loaded")
+    await workflow_engine.toggle_workflow(wf_id, api_key)
+    return {"status": "toggled"}
+
+
+@app.get("/api/v1/workflows/{wf_id}/logs")
+async def workflow_logs(wf_id: str, api_key: str = Depends(get_api_key)):
+    if not WORKFLOWS_AVAILABLE or not workflow_engine:
+        return {"logs": []}
+    logs = await workflow_engine.get_workflow_logs(wf_id, api_key)
+    return {"logs": logs}
 
 
 # ─── SCHEDULE ENDPOINTS ──────────────────────────────────
