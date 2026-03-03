@@ -160,6 +160,18 @@ except ImportError:
     STARTER_AGENTS = []
     logger.warning("⚠️ marketplace not found — no agent store")
 
+# Voice pipeline (STT + TTS)
+VOICE_AVAILABLE = False
+voice_pipeline = None
+try:
+    from voice import voice_pipeline as _vp, VoicePipeline, download_telegram_voice, VOICE_OPTIONS
+    VOICE_AVAILABLE = True
+    voice_pipeline = _vp
+    logger.info("✅ voice loaded — speech-to-text + text-to-speech")
+except ImportError:
+    VOICE_OPTIONS = {}
+    logger.warning("⚠️ voice not found — no voice interface")
+
 # Smart knowledge (optional)
 SMART_KNOWLEDGE = False
 try:
@@ -1586,7 +1598,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"   Memory: {'✅' if SWARM_MEMORY else '❌'} | MCP: {'✅' if MCP_AVAILABLE else '❌'} | Workflows: {'✅' if WORKFLOWS_AVAILABLE else '❌'} | Rate Limit: {'✅' if rate_limiter else '❌'}")
     logger.info(f"   Multi-Model: {'✅ ' + str(len([p for p in model_router.get_available_providers() if p['available']])) + ' providers' if MULTI_MODEL and model_router else '❌ Anthropic-only'}")
     channels_str = "/".join([c for c, e in [("TG", TELEGRAM_ENABLED), ("DC", DISCORD_ENABLED), ("SL", SLACK_ENABLED)] if e]) or "none"
-    logger.info(f"   Channels: {channels_str} | Marketplace: {'✅' if MARKETPLACE_AVAILABLE else '❌'} | Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
+    logger.info(f"   Channels: {channels_str} | Marketplace: {'✅' if MARKETPLACE_AVAILABLE else '❌'} | Voice: {'✅' if VOICE_AVAILABLE else '❌'} | Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
     yield
     scheduler_task.cancel()
     try:
@@ -1630,6 +1642,7 @@ async def health():
         "workflows": WORKFLOWS_AVAILABLE,
         "channels": {"telegram": TELEGRAM_ENABLED, "discord": DISCORD_ENABLED, "slack": SLACK_ENABLED},
         "marketplace": MARKETPLACE_AVAILABLE,
+        "voice": VOICE_AVAILABLE,
     }
 
 
@@ -1868,8 +1881,9 @@ async def stop_daemon(daemon_id: str, api_key: str = Depends(get_api_key)):
 
 @app.get("/api/v1/agents")
 async def list_agent_types():
-    """List all available agent types grouped by category."""
+    """List all available agent types grouped by category + flat list."""
     result = {}
+    flat = []
     for cat_name, cat_data in AGENT_CATEGORIES.items():
         result[cat_name] = {
             "icon": cat_data["icon"],
@@ -1878,7 +1892,26 @@ async def list_agent_types():
                 for aid, a in cat_data["agents"].items()
             },
         }
-    return result
+        for aid, a in cat_data["agents"].items():
+            flat.append({"type": aid, "name": a["name"], "description": a["description"], "category": cat_name})
+    return {"categories": result, "agents": flat, "total": len(flat)}
+
+
+@app.get("/api/v1/agents/recent")
+async def recent_agents(limit: int = 20, api_key: str = Depends(get_api_key)):
+    """List user's recent agent runs."""
+    conn = get_db()
+    try:
+        rows = db_fetchall(conn,
+            f"SELECT id, agent_type, task_description, status, created_at, completed_at FROM agents WHERE {USER_KEY_COL} = ? ORDER BY created_at DESC LIMIT ?",
+            (api_key, limit),
+        )
+    finally:
+        conn.close()
+    return {"agents": [
+        {"id": r[0], "agent_type": r[1], "task_description": r[2], "status": r[3], "created_at": r[4], "completed_at": r[5]}
+        for r in rows
+    ]}
 
 
 @app.post("/api/v1/deploy")
@@ -2277,6 +2310,144 @@ async def check_rate_limit(api_key: str = Depends(get_api_key)):
     return rate_limiter.get_usage(api_key, "starter")
 
 
+# ─── VOICE ENDPOINTS ─────────────────────────────────────
+
+@app.get("/api/v1/voice/status")
+async def voice_status():
+    if not VOICE_AVAILABLE or not voice_pipeline:
+        return {"stt": {"available": False}, "tts": {"available": False}}
+    return await voice_pipeline.get_voice_status()
+
+
+@app.get("/api/v1/voice/voices")
+async def list_voices():
+    return {"voices": VOICE_OPTIONS}
+
+
+@app.post("/api/v1/voice/transcribe")
+async def transcribe_audio(request: Request, api_key: str = Depends(get_api_key)):
+    """Upload audio and get transcription. Send raw audio bytes in request body."""
+    if not VOICE_AVAILABLE or not voice_pipeline:
+        raise HTTPException(status_code=503, detail="Voice not available")
+    audio_bytes = await request.body()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="No audio data")
+    result = await voice_pipeline.stt.transcribe(audio_bytes)
+    return result
+
+
+@app.post("/api/v1/voice/synthesize")
+async def synthesize_speech(request: Request, api_key: str = Depends(get_api_key)):
+    """Convert text to speech. Returns audio bytes."""
+    if not VOICE_AVAILABLE or not voice_pipeline:
+        raise HTTPException(status_code=503, detail="Voice not available")
+    body = await request.json()
+    text = body.get("text", "")
+    voice = body.get("voice")
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    result = await voice_pipeline.tts.synthesize(text, voice=voice)
+    if result.get("error") or not result.get("audio_bytes"):
+        raise HTTPException(status_code=500, detail=result.get("error", "TTS failed"))
+    from fastapi.responses import Response
+    return Response(
+        content=result["audio_bytes"],
+        media_type=f"audio/{result.get('format', 'opus')}",
+        headers={"X-Voice-Provider": result.get("provider", ""), "X-Voice-Name": result.get("voice", "")},
+    )
+
+
+@app.post("/api/v1/voice/deploy")
+async def voice_deploy_agent(request: Request, api_key: str = Depends(get_api_key)):
+    """Send voice audio, get agent result as text + voice. Full pipeline."""
+    if not VOICE_AVAILABLE or not voice_pipeline:
+        raise HTTPException(status_code=503, detail="Voice not available")
+
+    # Parse multipart or raw audio
+    content_type = request.headers.get("content-type", "")
+    if "json" in content_type:
+        body = await request.json()
+        audio_b64 = body.get("audio_base64", "")
+        if not audio_b64:
+            raise HTTPException(status_code=400, detail="audio_base64 required")
+        audio_bytes = base64.b64decode(audio_b64)
+        agent_type = body.get("agent_type", "research")
+        model = body.get("model")
+        voice = body.get("voice")
+        respond_voice = body.get("voice_response", True)
+    else:
+        audio_bytes = await request.body()
+        agent_type = request.query_params.get("agent_type", "research")
+        model = request.query_params.get("model")
+        voice = request.query_params.get("voice")
+        respond_voice = request.query_params.get("voice_response", "true") == "true"
+
+    # Transcribe
+    transcript = await voice_pipeline.stt.transcribe(audio_bytes)
+    if not transcript.get("text"):
+        raise HTTPException(status_code=400, detail=f"Transcription failed: {transcript.get('error', '')}")
+
+    task = transcript["text"]
+
+    # Deploy agent
+    agent_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        db_execute(conn,
+            f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+            (agent_id, api_key, agent_type, task, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    await execute_task(agent_id, agent_type, task, api_key, model=model)
+
+    # Get result
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT result, status FROM agents WHERE id = ?", (agent_id,)).fetchone()
+    finally:
+        conn.close()
+    result_text = row[0] if row else "No result"
+
+    response = {
+        "agent_id": agent_id,
+        "transcript": task,
+        "stt_provider": transcript.get("provider", ""),
+        "result": result_text,
+    }
+
+    # Synthesize voice response if requested
+    if respond_voice:
+        tts_result = await voice_pipeline.tts.synthesize(result_text[:2000], voice=voice)
+        if tts_result.get("audio_bytes"):
+            response["audio_base64"] = base64.b64encode(tts_result["audio_bytes"]).decode()
+            response["audio_format"] = tts_result.get("format", "opus")
+            response["tts_provider"] = tts_result.get("provider", "")
+
+    return response
+
+
+@app.post("/api/v1/voice/enable/{channel_id}")
+async def enable_voice_response(channel_id: str, api_key: str = Depends(get_api_key)):
+    if not VOICE_AVAILABLE or not voice_pipeline:
+        raise HTTPException(status_code=503, detail="Voice not available")
+    voice_pipeline.enable_voice_response(channel_id)
+    return {"status": "voice_response_enabled", "channel_id": channel_id}
+
+
+@app.post("/api/v1/voice/disable/{channel_id}")
+async def disable_voice_response(channel_id: str, api_key: str = Depends(get_api_key)):
+    if not VOICE_AVAILABLE or not voice_pipeline:
+        raise HTTPException(status_code=503, detail="Voice not available")
+    voice_pipeline.disable_voice_response(channel_id)
+    return {"status": "voice_response_disabled", "channel_id": channel_id}
+
+
+import base64
+
 # ─── MARKETPLACE ENDPOINTS ───────────────────────────────
 
 class CreateAgentRequest(BaseModel):
@@ -2673,15 +2844,91 @@ async def telegram_webhook(request: Request):
     if not TELEGRAM_ENABLED:
         return {"ok": True}
     data = await request.json()
+    message = data.get("message", {})
+
+    # Handle voice messages
+    voice = message.get("voice") or message.get("audio")
+    if voice and VOICE_AVAILABLE and voice_pipeline:
+        asyncio.create_task(_handle_telegram_voice(message, voice))
+        return {"ok": True}
+
     if CHANNELS_LOADED:
         msg = parse_telegram_webhook(data)
         if msg:
             asyncio.create_task(command_router.handle(msg))
     else:
-        message = data.get("message")
-        if message:
+        if message.get("text"):
             asyncio.create_task(handle_telegram_message(message))
     return {"ok": True}
+
+
+async def _handle_telegram_voice(message: dict, voice_info: dict):
+    """Process incoming Telegram voice message."""
+    chat_id = message.get("chat", {}).get("id")
+    if not chat_id:
+        return
+    try:
+        from channels import send_telegram
+        await send_telegram(chat_id, "🎙️ Transcribing your voice...")
+
+        # Download voice file
+        file_id = voice_info.get("file_id", "")
+        audio_bytes = await download_telegram_voice(file_id)
+        if not audio_bytes:
+            await send_telegram(chat_id, "❌ Failed to download voice message")
+            return
+
+        # Transcribe
+        result = await voice_pipeline.process_voice_message(
+            audio_bytes=audio_bytes,
+            platform="telegram",
+            channel_id=str(chat_id),
+            user_id=str(message.get("from", {}).get("id", "")),
+        )
+
+        if result.get("error") or not result.get("text"):
+            await send_telegram(chat_id, f"❌ Transcription failed: {result.get('error', 'unknown')}")
+            return
+
+        text = result["text"]
+        await send_telegram(chat_id, f"📝 *Heard:* {text}")
+
+        # Route transcribed text through command router
+        if CHANNELS_LOADED:
+            from channels import ChannelMessage
+            msg = ChannelMessage(
+                platform="telegram",
+                channel_id=str(chat_id),
+                user_id=str(message.get("from", {}).get("id", "")),
+                text=text,
+            )
+            await command_router.handle(msg)
+
+            # If voice response is enabled, also send TTS of the result
+            if voice_pipeline.is_voice_enabled(str(chat_id)):
+                # Get the agent result from DB
+                conn = get_db()
+                try:
+                    row = conn.execute(
+                        f"SELECT result FROM agents WHERE {USER_KEY_COL} = ? ORDER BY created_at DESC LIMIT 1",
+                        (f"telegram:{chat_id}",),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row and row[0]:
+                    await voice_pipeline.synthesize_and_send(
+                        text=row[0][:2000],
+                        platform="telegram",
+                        channel_id=str(chat_id),
+                    )
+
+    except Exception as e:
+        logger.error(f"Voice handler error: {e}")
+        try:
+            from channels import send_telegram
+            await send_telegram(chat_id, f"❌ Voice processing error: {str(e)[:200]}")
+        except Exception:
+            pass
 
 
 @app.post("/api/v1/discord/webhook")
@@ -2748,890 +2995,757 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>APEX SWARM v3</title>
+<title>APEX SWARM v4 — Command Center</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,500;0,9..144,700;1,9..144,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg: #0a0a0f;
-  --surface: #12121a;
-  --surface2: #1a1a26;
-  --border: #2a2a3a;
-  --text: #e8e8f0;
-  --text2: #9090a8;
-  --accent: #7c5cfc;
-  --accent2: #5c3cdc;
-  --success: #34d399;
-  --warning: #fbbf24;
-  --danger: #f87171;
-  --running: #60a5fa;
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#050508;--surface:#0c0c14;--surface2:#13131f;--surface3:#1a1a2a;
+  --border:#252538;--border2:#353548;
+  --text:#e4e4f0;--text2:#8888a8;--text3:#5555708;
+  --green:#00ff88;--green2:#00cc6a;--greenbg:rgba(0,255,136,0.08);
+  --red:#ff4466;--redbg:rgba(255,68,102,0.08);
+  --blue:#4488ff;--bluebg:rgba(68,136,255,0.08);
+  --purple:#8855ff;--purplebg:rgba(136,85,255,0.08);
+  --orange:#ff8844;--orangebg:rgba(255,136,68,0.08);
+  --yellow:#ffcc00;
+  --radius:10px;--radius2:16px;
 }
-* { margin:0; padding:0; box-sizing:border-box; }
-body {
-  font-family: 'DM Sans', sans-serif;
-  background: var(--bg);
-  color: var(--text);
-  min-height: 100vh;
-}
-.header {
-  background: linear-gradient(135deg, var(--surface) 0%, #15152a 100%);
-  border-bottom: 1px solid var(--border);
-  padding: 20px 32px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.logo {
-  font-family: 'Fraunces', serif;
-  font-size: 28px;
-  font-weight: 700;
-  background: linear-gradient(135deg, var(--accent), #a78bfa);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-.version {
-  font-size: 12px;
-  color: var(--text2);
-  margin-left: 12px;
-  font-weight: 300;
-}
-.status-badges { display: flex; gap: 8px; }
-.badge {
-  padding: 4px 10px;
-  border-radius: 20px;
-  font-size: 11px;
-  font-weight: 500;
-}
-.badge-on { background: rgba(52,211,153,0.15); color: var(--success); }
-.badge-off { background: rgba(248,113,113,0.15); color: var(--danger); }
+body{background:var(--bg);color:var(--text);font-family:'Outfit',sans-serif;overflow-x:hidden;min-height:100vh}
+a{color:var(--green);text-decoration:none}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--surface)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 
-.auth-bar {
-  padding: 12px 32px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-.auth-bar input {
-  flex: 1;
-  max-width: 400px;
-  padding: 8px 14px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  font-size: 13px;
-  font-family: inherit;
-}
-.auth-bar input:focus { outline: none; border-color: var(--accent); }
+/* ─── LAYOUT ─── */
+.app{display:grid;grid-template-columns:240px 1fr;grid-template-rows:60px 1fr;height:100vh}
+.topbar{grid-column:1/-1;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;z-index:100}
+.sidebar{background:var(--surface);border-right:1px solid var(--border);padding:16px 12px;overflow-y:auto}
+.main{overflow-y:auto;padding:24px;background:var(--bg)}
 
-.tabs {
-  display: flex;
-  gap: 0;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  padding: 0 32px;
-}
-.tab {
-  padding: 14px 24px;
-  cursor: pointer;
-  color: var(--text2);
-  font-size: 14px;
-  font-weight: 500;
-  border-bottom: 2px solid transparent;
-  transition: all 0.2s;
-}
-.tab:hover { color: var(--text); }
-.tab.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
+/* ─── TOPBAR ─── */
+.logo{font-family:'Space Mono',monospace;font-weight:700;font-size:18px;color:var(--green);letter-spacing:-0.5px}
+.logo span{color:var(--text2);font-weight:400;font-size:13px;margin-left:8px}
+.topbar-right{display:flex;align-items:center;gap:16px}
+.status-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.api-key-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 12px;border-radius:6px;font-size:12px;width:200px;font-family:'Space Mono',monospace}
+.api-key-input::placeholder{color:var(--text2)}
 
-.main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
-.tab-content { display: none; }
-.tab-content.active { display: block; }
+/* ─── SIDEBAR ─── */
+.nav-section{margin-bottom:24px}
+.nav-label{font-size:10px;text-transform:uppercase;letter-spacing:2px;color:var(--text2);padding:0 12px;margin-bottom:8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;cursor:pointer;font-size:14px;color:var(--text2);transition:all 0.15s}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{background:var(--greenbg);color:var(--green);font-weight:500}
+.nav-icon{font-size:18px;width:24px;text-align:center}
+.nav-badge{margin-left:auto;background:var(--green);color:var(--bg);font-size:10px;font-weight:700;padding:2px 6px;border-radius:10px}
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+/* ─── CARDS ─── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius2);padding:20px;transition:border-color 0.2s}
+.card:hover{border-color:var(--border2)}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.card-title{font-weight:600;font-size:16px}
+.card-subtitle{color:var(--text2);font-size:13px;margin-top:4px}
 
-.category-section { margin-bottom: 32px; }
-.category-title {
-  font-family: 'Fraunces', serif;
-  font-size: 20px;
-  font-weight: 500;
-  margin-bottom: 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
+/* ─── BUTTONS ─── */
+.btn{padding:8px 16px;border-radius:8px;border:none;font-family:'Outfit',sans-serif;font-weight:500;font-size:13px;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:var(--green);color:var(--bg)}
+.btn-primary:hover{background:var(--green2);transform:translateY(-1px)}
+.btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
+.btn-secondary:hover{border-color:var(--green);color:var(--green)}
+.btn-danger{background:var(--redbg);color:var(--red);border:1px solid transparent}
+.btn-danger:hover{border-color:var(--red)}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-lg{padding:12px 24px;font-size:15px}
 
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.card:hover {
-  border-color: var(--accent);
-  transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(124,92,252,0.1);
-}
-.card-name {
-  font-weight: 600;
-  font-size: 15px;
-  margin-bottom: 4px;
-}
-.card-desc {
-  color: var(--text2);
-  font-size: 13px;
-  line-height: 1.5;
-}
-.card-meta {
-  margin-top: 10px;
-  font-size: 11px;
-  color: var(--text2);
-  display: flex;
-  gap: 12px;
-}
+/* ─── GRID ─── */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
 
-/* Pipeline / Collab cards */
-.pipeline-card, .collab-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  transition: all 0.2s;
-}
-.pipeline-card:hover, .collab-card:hover {
-  border-color: var(--accent);
-}
+/* ─── STAT CARDS ─── */
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px}
+.stat-value{font-family:'Space Mono',monospace;font-size:28px;font-weight:700;color:var(--green)}
+.stat-label{color:var(--text2);font-size:12px;margin-top:4px;text-transform:uppercase;letter-spacing:1px}
 
-/* Deploy modal */
-.modal-overlay {
-  display: none;
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.7);
-  z-index: 100;
-  justify-content: center;
-  align-items: center;
-}
-.modal-overlay.show { display: flex; }
-.modal {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 28px;
-  width: 90%;
-  max-width: 600px;
-  max-height: 85vh;
-  overflow-y: auto;
-}
-.modal h2 {
-  font-family: 'Fraunces', serif;
-  font-size: 22px;
-  margin-bottom: 4px;
-}
-.modal-desc { color: var(--text2); font-size: 13px; margin-bottom: 18px; }
-.modal textarea {
-  width: 100%;
-  padding: 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  font-family: inherit;
-  font-size: 14px;
-  min-height: 100px;
-  resize: vertical;
-}
-.modal textarea:focus { outline: none; border-color: var(--accent); }
+/* ─── MARKETPLACE ─── */
+.mp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.mp-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius2);padding:20px;cursor:pointer;transition:all 0.2s;position:relative;overflow:hidden}
+.mp-card:hover{border-color:var(--green);transform:translateY(-2px);box-shadow:0 8px 32px rgba(0,255,136,0.06)}
+.mp-icon{font-size:32px;margin-bottom:12px}
+.mp-name{font-weight:600;font-size:16px;margin-bottom:4px}
+.mp-desc{color:var(--text2);font-size:13px;line-height:1.5;margin-bottom:12px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.mp-meta{display:flex;align-items:center;gap:12px;font-size:12px;color:var(--text2)}
+.mp-tag{background:var(--surface2);padding:3px 8px;border-radius:4px;font-size:11px;color:var(--text2)}
+.mp-price{font-family:'Space Mono',monospace;font-weight:700;color:var(--green)}
+.mp-rating{color:var(--yellow)}
+.mp-installs{color:var(--text2)}
+.mp-category-bar{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap}
+.mp-cat-btn{padding:6px 14px;border-radius:20px;border:1px solid var(--border);background:transparent;color:var(--text2);font-size:13px;cursor:pointer;transition:all 0.15s;font-family:'Outfit',sans-serif}
+.mp-cat-btn:hover,.mp-cat-btn.active{border-color:var(--green);color:var(--green);background:var(--greenbg)}
 
-.btn {
-  padding: 10px 20px;
-  border-radius: 8px;
-  border: none;
-  font-family: inherit;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.btn-primary {
-  background: var(--accent);
-  color: white;
-}
-.btn-primary:hover { background: var(--accent2); }
-.btn-ghost {
-  background: transparent;
-  color: var(--text2);
-  border: 1px solid var(--border);
-}
-.btn-ghost:hover { border-color: var(--text2); }
-.btn-sm { padding: 6px 14px; font-size: 12px; }
-.btn-danger { background: rgba(248,113,113,0.15); color: var(--danger); }
-.btn-danger:hover { background: rgba(248,113,113,0.25); }
-.modal-actions { display: flex; gap: 10px; margin-top: 16px; justify-content: flex-end; }
+/* ─── DEPLOY PANEL ─── */
+.deploy-form{display:flex;flex-direction:column;gap:12px}
+.form-group{display:flex;flex-direction:column;gap:6px}
+.form-label{font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:1px}
+.form-input,.form-select,.form-textarea{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;font-family:'Outfit',sans-serif;font-size:14px;outline:none;transition:border-color 0.15s}
+.form-input:focus,.form-select:focus,.form-textarea:focus{border-color:var(--green)}
+.form-textarea{min-height:100px;resize:vertical}
+.form-select{cursor:pointer}
 
-/* Result panel */
-.result-panel {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  margin-top: 20px;
-  display: none;
-}
-.result-panel.show { display: block; }
-.result-status {
-  display: inline-block;
-  padding: 3px 10px;
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 500;
-}
-.status-running { background: rgba(96,165,250,0.15); color: var(--running); }
-.status-completed { background: rgba(52,211,153,0.15); color: var(--success); }
-.status-failed { background: rgba(248,113,113,0.15); color: var(--danger); }
-.result-text {
-  margin-top: 14px;
-  font-size: 14px;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  color: var(--text);
-}
-.result-text h1, .result-text h2, .result-text h3 { font-family: 'Fraunces', serif; margin: 16px 0 8px; }
-.result-text strong { color: var(--accent); }
-.result-text code { background: var(--bg); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-.result-text pre {
-  background: var(--bg);
-  padding: 14px;
-  border-radius: 8px;
-  overflow-x: auto;
-  margin: 10px 0;
-}
+/* ─── AGENT LIST ─── */
+.agent-row{display:flex;align-items:center;gap:16px;padding:12px 16px;border-bottom:1px solid var(--border);transition:background 0.1s}
+.agent-row:hover{background:var(--surface2)}
+.agent-status{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.agent-status.running{background:var(--green);animation:pulse 2s infinite}
+.agent-status.completed{background:var(--blue)}
+.agent-status.failed{background:var(--red)}
+.agent-name{font-weight:500;font-size:14px;flex:1}
+.agent-task{color:var(--text2);font-size:12px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agent-time{color:var(--text2);font-size:12px;font-family:'Space Mono',monospace}
 
-/* Schedule list */
-.schedule-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 18px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  margin-bottom: 8px;
-}
-.schedule-info { flex: 1; }
-.schedule-info .sched-agent { font-weight: 600; font-size: 14px; }
-.schedule-info .sched-task { color: var(--text2); font-size: 13px; margin-top: 2px; }
-.schedule-info .sched-cron { color: var(--accent); font-size: 12px; margin-top: 4px; }
-.schedule-actions { display: flex; gap: 8px; align-items: center; }
+/* ─── EVENT FEED ─── */
+.event{padding:10px 16px;border-left:3px solid var(--border);margin-bottom:8px;font-size:13px;background:var(--surface);border-radius:0 8px 8px 0}
+.event.agent-started{border-left-color:var(--green)}
+.event.agent-completed{border-left-color:var(--blue)}
+.event.agent-failed{border-left-color:var(--red)}
+.event.daemon-alert{border-left-color:var(--orange)}
+.event-time{color:var(--text2);font-size:11px;font-family:'Space Mono',monospace}
+.event-msg{margin-top:4px}
 
-.toggle-switch {
-  position: relative;
-  width: 40px;
-  height: 22px;
-  background: var(--border);
-  border-radius: 11px;
-  cursor: pointer;
-  transition: background 0.2s;
-}
-.toggle-switch.on { background: var(--accent); }
-.toggle-switch::after {
-  content: '';
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 16px;
-  height: 16px;
-  background: white;
-  border-radius: 50%;
-  transition: transform 0.2s;
-}
-.toggle-switch.on::after { transform: translateX(18px); }
+/* ─── MODAL ─── */
+.modal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:1000;backdrop-filter:blur(4px)}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius2);padding:28px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto}
+.modal-title{font-size:20px;font-weight:700;margin-bottom:16px}
+.modal-close{position:absolute;top:16px;right:16px;background:none;border:none;color:var(--text2);font-size:20px;cursor:pointer}
 
-.empty-state {
-  text-align: center;
-  padding: 60px 20px;
-  color: var(--text2);
-}
-.empty-state .icon { font-size: 48px; margin-bottom: 12px; }
-.empty-state p { font-size: 14px; }
+/* ─── WORKFLOW BUILDER ─── */
+.wf-node{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;position:relative}
+.wf-node-title{font-weight:600;font-size:14px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.wf-connector{width:2px;height:24px;background:var(--border);margin:0 auto}
+.wf-arrow{text-align:center;color:var(--text2);font-size:20px;margin:4px 0}
 
-/* Schedule creation form */
-.sched-form { margin-bottom: 24px; }
-.sched-form .form-row {
-  display: flex;
-  gap: 12px;
-  margin-bottom: 10px;
-  align-items: center;
-}
-.sched-form select, .sched-form input {
-  padding: 8px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  font-family: inherit;
-  font-size: 13px;
-}
-.sched-form select:focus, .sched-form input:focus {
-  outline: none;
-  border-color: var(--accent);
-}
+/* ─── TABS ─── */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.tab{padding:10px 20px;font-size:14px;color:var(--text2);cursor:pointer;border-bottom:2px solid transparent;transition:all 0.15s}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--green);border-bottom-color:var(--green)}
 
-@media (max-width: 768px) {
-  .header { padding: 16px; }
-  .main { padding: 16px; }
-  .grid { grid-template-columns: 1fr; }
-  .tabs { padding: 0 16px; overflow-x: auto; }
-  .tab { padding: 12px 16px; white-space: nowrap; }
-}
+/* ─── RESPONSIVE ─── */
+@media(max-width:768px){.app{grid-template-columns:1fr}.sidebar{display:none}.grid-3,.grid-4{grid-template-columns:1fr 1fr}.mp-grid{grid-template-columns:1fr}}
+
+/* ─── ANIMATIONS ─── */
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn 0.3s ease}
+@keyframes slideIn{from{opacity:0;transform:translateX(-20px)}to{opacity:1;transform:translateX(0)}}
+.slide-in{animation:slideIn 0.3s ease}
+
+/* ─── LOADING ─── */
+.spinner{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--green);border-radius:50%;animation:spin 0.6s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.empty-state{text-align:center;padding:60px 20px;color:var(--text2)}
+.empty-state-icon{font-size:48px;margin-bottom:16px;opacity:0.5}
+.empty-state-text{font-size:15px;margin-bottom:20px}
 </style>
 </head>
 <body>
 
-<div class="header">
-  <div style="display:flex;align-items:baseline;">
-    <span class="logo">APEX SWARM</span>
-    <span class="version">v__VERSION__</span>
-  </div>
-  <div class="status-badges" id="statusBadges"></div>
-</div>
-
-<div class="auth-bar">
-  <input type="password" id="apiKey" placeholder="Enter your API key..." value="">
-  <button class="btn btn-primary btn-sm" onclick="checkHealth()">Connect</button>
-</div>
-
-<div class="tabs">
-  <div class="tab active" data-tab="agents">🤖 Agents</div>
-  <div class="tab" data-tab="pipelines">🔗 Pipelines</div>
-  <div class="tab" data-tab="collabs">🧠 Collaboration</div>
-  <div class="tab" data-tab="scheduled">⏰ Scheduled</div>
-  <div class="tab" data-tab="godeye">👁️ God Eye</div>
-</div>
-
-<div class="main">
-
-  <!-- AGENTS TAB -->
-  <div class="tab-content active" id="tab-agents">
-    <div id="agentGrid"></div>
-    <div class="result-panel" id="resultPanel">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <div>
-          <strong id="resultAgent"></strong>
-          <span class="result-status" id="resultStatus"></span>
-        </div>
-        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('resultPanel').classList.remove('show')">✕</button>
+<div class="app" id="app">
+  <!-- TOPBAR -->
+  <div class="topbar">
+    <div class="logo">APEX SWARM <span>v__VERSION__</span></div>
+    <div class="topbar-right">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="status-dot" id="statusDot"></div>
+        <span style="font-size:12px;color:var(--text2)" id="statusText">Connected</span>
       </div>
-      <div class="result-text" id="resultText"></div>
+      <input type="password" class="api-key-input" id="apiKeyInput" placeholder="API Key" />
+      <button class="btn btn-primary btn-sm" onclick="saveApiKey()">Connect</button>
     </div>
   </div>
 
-  <!-- PIPELINES TAB -->
-  <div class="tab-content" id="tab-pipelines">
-    <div class="grid" id="pipelineGrid"></div>
-    <div class="result-panel" id="pipelineResult">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <strong id="pipelineResultTitle"></strong>
-        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('pipelineResult').classList.remove('show')">✕</button>
+  <!-- SIDEBAR -->
+  <div class="sidebar">
+    <div class="nav-section">
+      <div class="nav-label">Command Center</div>
+      <div class="nav-item active" data-page="overview" onclick="navigate('overview')">
+        <span class="nav-icon">👁️</span> God Eye
       </div>
-      <div class="result-text" id="pipelineResultText"></div>
+      <div class="nav-item" data-page="deploy" onclick="navigate('deploy')">
+        <span class="nav-icon">⚡</span> Deploy Agent
+      </div>
+      <div class="nav-item" data-page="agents" onclick="navigate('agents')">
+        <span class="nav-icon">🤖</span> My Agents
+      </div>
+      <div class="nav-item" data-page="feed" onclick="navigate('feed')">
+        <span class="nav-icon">📡</span> Live Feed
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Marketplace</div>
+      <div class="nav-item" data-page="marketplace" onclick="navigate('marketplace')">
+        <span class="nav-icon">🏪</span> Browse Agents
+        <span class="nav-badge" id="mpBadge">NEW</span>
+      </div>
+      <div class="nav-item" data-page="create-agent" onclick="navigate('create-agent')">
+        <span class="nav-icon">🛠️</span> Create Agent
+      </div>
+      <div class="nav-item" data-page="my-store" onclick="navigate('my-store')">
+        <span class="nav-icon">💰</span> My Store
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">Automation</div>
+      <div class="nav-item" data-page="workflows" onclick="navigate('workflows')">
+        <span class="nav-icon">⚙️</span> Workflows
+      </div>
+      <div class="nav-item" data-page="daemons" onclick="navigate('daemons')">
+        <span class="nav-icon">👁️</span> Daemons
+      </div>
+      <div class="nav-item" data-page="schedules" onclick="navigate('schedules')">
+        <span class="nav-icon">🕐</span> Schedules
+      </div>
+    </div>
+    <div class="nav-section">
+      <div class="nav-label">System</div>
+      <div class="nav-item" data-page="models" onclick="navigate('models')">
+        <span class="nav-icon">🧠</span> Models
+      </div>
+      <div class="nav-item" data-page="channels" onclick="navigate('channels')">
+        <span class="nav-icon">💬</span> Channels
+      </div>
+      <div class="nav-item" data-page="settings" onclick="navigate('settings')">
+        <span class="nav-icon">⚙️</span> Settings
+      </div>
     </div>
   </div>
 
-  <!-- COLLABS TAB -->
-  <div class="tab-content" id="tab-collabs">
-    <div class="grid" id="collabGrid"></div>
-    <div class="result-panel" id="collabResult">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <strong id="collabResultTitle"></strong>
-        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('collabResult').classList.remove('show')">✕</button>
-      </div>
-      <div class="result-text" id="collabResultText"></div>
-    </div>
-  </div>
-
-  <!-- SCHEDULED TAB -->
-  <div class="tab-content" id="tab-scheduled">
-    <div class="sched-form">
-      <h3 style="font-family:'Fraunces',serif;margin-bottom:12px;">Create Schedule</h3>
-      <div class="form-row">
-        <select id="schedAgent"></select>
-        <select id="schedFreq">
-          <option value="daily">Daily (8 AM UTC)</option>
-          <option value="twice-daily">Twice Daily</option>
-          <option value="weekly">Weekly (Monday)</option>
-          <option value="weekdays">Weekdays</option>
-          <option value="hourly">Hourly</option>
-          <option value="every-6h">Every 6 Hours</option>
-          <option value="every-12h">Every 12 Hours</option>
-          <option value="monthly">Monthly</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <input type="text" id="schedTask" placeholder="Task description..." style="flex:1;">
-        <button class="btn btn-primary btn-sm" onclick="createSchedule()">Create</button>
-      </div>
-    </div>
-    <div id="scheduleList"></div>
-  </div>
-
-  <!-- GOD EYE TAB -->
-  <div class="tab-content" id="tab-godeye">
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:24px;" id="godeyeStats">
-      <div class="card" style="text-align:center;cursor:default;">
-        <div style="font-size:32px;font-family:'Fraunces',serif;color:var(--accent);" id="geActiveAgents">0</div>
-        <div style="color:var(--text2);font-size:13px;">Active Agents</div>
-      </div>
-      <div class="card" style="text-align:center;cursor:default;">
-        <div style="font-size:32px;font-family:'Fraunces',serif;color:var(--success);" id="geActiveDaemons">0</div>
-        <div style="color:var(--text2);font-size:13px;">Daemons Running</div>
-      </div>
-      <div class="card" style="text-align:center;cursor:default;">
-        <div style="font-size:32px;font-family:'Fraunces',serif;color:var(--warning);" id="geTotalEvents">0</div>
-        <div style="color:var(--text2);font-size:13px;">Total Events</div>
-      </div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-      <!-- Daemons Panel -->
-      <div>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-          <h3 style="font-family:'Fraunces',serif;">Daemons</h3>
-          <select id="daemonPreset" style="padding:6px 10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;">
-            <option value="">Start daemon...</option>
-          </select>
-          <button class="btn btn-primary btn-sm" onclick="startDaemon()">Start</button>
-        </div>
-        <div id="daemonList"></div>
-      </div>
-
-      <!-- Live Event Feed -->
-      <div>
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-          <h3 style="font-family:'Fraunces',serif;">Live Feed</h3>
-          <div>
-            <button class="btn btn-sm" id="sseToggle" onclick="toggleSSE()" style="background:var(--success);color:white;">● Connected</button>
-          </div>
-        </div>
-        <div id="eventFeed" style="max-height:500px;overflow-y:auto;display:flex;flex-direction:column-reverse;gap:6px;"></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Deploy Modal -->
-<div class="modal-overlay" id="deployModal">
-  <div class="modal">
-    <h2 id="modalTitle"></h2>
-    <p class="modal-desc" id="modalDesc"></p>
-    <textarea id="modalTask" placeholder="Describe your task..."></textarea>
-    <div class="modal-actions">
-      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn btn-primary" id="modalDeploy" onclick="deployFromModal()">Deploy ⚡</button>
-    </div>
-  </div>
+  <!-- MAIN -->
+  <div class="main" id="mainContent"></div>
 </div>
 
 <script>
-const API = '';
-let currentDeploy = {};
+// ─── STATE ───────────────────────────────────────
+let API_KEY = localStorage.getItem('apex_api_key') || '';
+let BASE_URL = window.location.origin;
+let currentPage = 'overview';
+let godEyeData = {};
+let eventSource = null;
+let liveEvents = [];
 
-// ─── Tabs ───
-document.querySelectorAll('.tab').forEach(tab => {
-  tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-    tab.classList.add('active');
-    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-    if (tab.dataset.tab === 'pipelines') loadPipelines();
-    if (tab.dataset.tab === 'collabs') loadCollabs();
-    if (tab.dataset.tab === 'scheduled') loadSchedules();
-    if (tab.dataset.tab === 'godeye') { loadDaemons(); refreshGodEye(); connectSSE(); }
-  });
-});
-
-function getKey() { return document.getElementById('apiKey').value || 'demo'; }
-function headers() { return { 'Content-Type': 'application/json', 'X-Api-Key': getKey() }; }
-
-// ─── Health ───
-async function checkHealth() {
+// ─── API ─────────────────────────────────────────
+async function api(path, opts = {}) {
+  const headers = { 'X-Api-Key': API_KEY, 'Content-Type': 'application/json', ...opts.headers };
   try {
-    const r = await fetch(API + '/api/v1/health');
-    const d = await r.json();
-    const badges = document.getElementById('statusBadges');
-    badges.innerHTML = `
-      <span class="badge ${d.tools ? 'badge-on' : 'badge-off'}">Tools ${d.tools ? '✓' : '✗'}</span>
-      <span class="badge ${d.chains ? 'badge-on' : 'badge-off'}">Chains ${d.chains ? '✓' : '✗'}</span>
-      <span class="badge ${d.smart_knowledge ? 'badge-on' : 'badge-off'}">Knowledge ${d.smart_knowledge ? '✓' : '✗'}</span>
-      <span class="badge badge-on">${d.agents} Agents</span>
-    `;
-  } catch(e) { console.error(e); }
+    const r = await fetch(BASE_URL + path, { ...opts, headers });
+    return await r.json();
+  } catch(e) { console.error('API Error:', e); return { error: e.message }; }
 }
 
-// ─── Agents Tab ───
-async function loadAgents() {
-  try {
-    const r = await fetch(API + '/api/v1/agents');
-    const data = await r.json();
-    const grid = document.getElementById('agentGrid');
-    let html = '';
-    for (const [cat, info] of Object.entries(data)) {
-      html += `<div class="category-section"><div class="category-title">${info.icon} ${cat}</div><div class="grid">`;
-      for (const [id, agent] of Object.entries(info.agents)) {
-        html += `<div class="card" onclick="openDeploy('agent','${id}','${agent.name.replace(/'/g,"\\'")}','${agent.description.replace(/'/g,"\\'")}')">
-          <div class="card-name">${agent.name}</div>
-          <div class="card-desc">${agent.description}</div>
-        </div>`;
-      }
-      html += '</div></div>';
-    }
-    grid.innerHTML = html;
-    // populate schedule agent dropdown
-    const sel = document.getElementById('schedAgent');
-    sel.innerHTML = '';
-    for (const [cat, info] of Object.entries(data)) {
-      for (const [id, agent] of Object.entries(info.agents)) {
-        sel.innerHTML += `<option value="${id}">${agent.name}</option>`;
-      }
-    }
-  } catch(e) { console.error(e); }
+function saveApiKey() {
+  API_KEY = document.getElementById('apiKeyInput').value;
+  localStorage.setItem('apex_api_key', API_KEY);
+  navigate(currentPage);
 }
 
-// ─── Pipelines Tab ───
-async function loadPipelines() {
-  try {
-    const r = await fetch(API + '/api/v1/pipelines');
-    const data = await r.json();
-    const grid = document.getElementById('pipelineGrid');
-    if (!data.pipelines || Object.keys(data.pipelines).length === 0) {
-      grid.innerHTML = '<div class="empty-state"><div class="icon">🔗</div><p>No pipelines available. Deploy agent_chains.py to enable.</p></div>';
-      return;
-    }
-    let html = '';
-    for (const [id, p] of Object.entries(data.pipelines)) {
-      html += `<div class="pipeline-card">
-        <div class="card-name">${p.name}</div>
-        <div class="card-desc">${p.description}</div>
-        <div class="card-meta"><span>${p.steps} steps</span><span>${p.category}</span></div>
-        <div style="margin-top:12px"><button class="btn btn-primary btn-sm" onclick="openDeploy('pipeline','${id}','${p.name.replace(/'/g,"\\'")}','${p.description.replace(/'/g,"\\'")}')">Deploy Pipeline</button></div>
-      </div>`;
-    }
-    grid.innerHTML = html;
-  } catch(e) { console.error(e); }
+// ─── NAVIGATION ──────────────────────────────────
+function navigate(page) {
+  currentPage = page;
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === page));
+  const main = document.getElementById('mainContent');
+  main.innerHTML = '<div style="display:flex;justify-content:center;padding:40px"><div class="spinner"></div></div>';
+  const pages = {overview:renderOverview,deploy:renderDeploy,agents:renderAgents,feed:renderFeed,marketplace:renderMarketplace,'create-agent':renderCreateAgent,'my-store':renderMyStore,workflows:renderWorkflows,daemons:renderDaemons,models:renderModels,channels:renderChannels,settings:renderSettings,schedules:renderSchedules};
+  (pages[page] || renderOverview)();
 }
 
-// ─── Collabs Tab ───
-async function loadCollabs() {
-  try {
-    const r = await fetch(API + '/api/v1/collabs');
-    const data = await r.json();
-    const grid = document.getElementById('collabGrid');
-    if (!data.collabs || Object.keys(data.collabs).length === 0) {
-      grid.innerHTML = '<div class="empty-state"><div class="icon">🧠</div><p>No collaboration templates available.</p></div>';
-      return;
-    }
-    let html = '';
-    for (const [id, c] of Object.entries(data.collabs)) {
-      html += `<div class="collab-card">
-        <div class="card-name">${c.name}</div>
-        <div class="card-desc">${c.description}</div>
-        <div class="card-meta"><span>${c.agents} agents</span><span>${c.category}</span></div>
-        <div style="margin-top:12px"><button class="btn btn-primary btn-sm" onclick="openDeploy('collab','${id}','${c.name.replace(/'/g,"\\'")}','${c.description.replace(/'/g,"\\'")}')">Deploy Collab</button></div>
-      </div>`;
-    }
-    grid.innerHTML = html;
-  } catch(e) { console.error(e); }
-}
-
-// ─── Schedules Tab ───
-async function loadSchedules() {
-  try {
-    const r = await fetch(API + '/api/v1/schedules', { headers: headers() });
-    const data = await r.json();
-    const list = document.getElementById('scheduleList');
-    if (!data || data.length === 0) {
-      list.innerHTML = '<div class="empty-state"><div class="icon">⏰</div><p>No schedules yet. Create one above.</p></div>';
-      return;
-    }
-    let html = '';
-    for (const s of data) {
-      html += `<div class="schedule-row">
-        <div class="schedule-info">
-          <div class="sched-agent">${s.agent_type} ${s.schedule_type !== 'single' ? '(' + s.schedule_type + ')' : ''}</div>
-          <div class="sched-task">${s.task_description}</div>
-          <div class="sched-cron">${s.schedule_description}${s.last_run ? ' · Last: ' + new Date(s.last_run).toLocaleString() : ''}</div>
+// ─── GOD EYE ─────────────────────────────────────
+async function renderOverview() {
+  const [health, godEye, mpStats] = await Promise.all([
+    api('/api/v1/health'), api('/api/v1/god-eye'), api('/api/v1/marketplace/stats')
+  ]);
+  const ge = godEye || {};
+  const mp = mpStats || {};
+  const h = health || {};
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">👁️ God Eye — Live Overview</h2>
+      <div class="grid-4" style="margin-bottom:24px">
+        <div class="stat"><div class="stat-value">${ge.active_agents||0}</div><div class="stat-label">Active Agents</div></div>
+        <div class="stat"><div class="stat-value">${ge.active_daemons||0}</div><div class="stat-label">Daemons</div></div>
+        <div class="stat"><div class="stat-value">${ge.total_events||0}</div><div class="stat-label">Total Events</div></div>
+        <div class="stat"><div class="stat-value" style="color:var(--blue)">${mp.published_agents||0}</div><div class="stat-label">Marketplace Agents</div></div>
+      </div>
+      <div class="grid-2" style="margin-bottom:24px">
+        <div class="card">
+          <div class="card-header"><div class="card-title">System Status</div></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+            ${Object.entries({Tools:h.tools,Chains:h.chains,Knowledge:h.knowledge,'Mission Control':h.mission_control,Memory:h.swarm_memory,MCP:h.mcp_registry,'Multi-Model':h.multi_model,Marketplace:h.marketplace,Voice:h.voice,Workflows:h.workflows}).map(([k,v])=>`<div style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><span>${v?'🟢':'🔴'}</span>${k}</div>`).join('')}
+          </div>
         </div>
-        <div class="schedule-actions">
-          <div class="toggle-switch ${s.enabled ? 'on' : ''}" onclick="toggleSched('${s.id}', this)"></div>
-          <button class="btn btn-danger btn-sm" onclick="deleteSched('${s.id}')">✕</button>
+        <div class="card">
+          <div class="card-header"><div class="card-title">Recent Events</div></div>
+          <div id="overviewEvents" style="max-height:250px;overflow-y:auto"></div>
         </div>
-      </div>`;
-    }
-    list.innerHTML = html;
-  } catch(e) { console.error(e); }
+      </div>
+      <div class="grid-3">
+        <div class="card" style="cursor:pointer" onclick="navigate('deploy')">
+          <div style="font-size:32px;margin-bottom:8px">⚡</div>
+          <div class="card-title">Deploy Agent</div>
+          <div class="card-subtitle">Deploy any of 66+ agents instantly</div>
+        </div>
+        <div class="card" style="cursor:pointer" onclick="navigate('marketplace')">
+          <div style="font-size:32px;margin-bottom:8px">🏪</div>
+          <div class="card-title">Marketplace</div>
+          <div class="card-subtitle">${mp.published_agents||0} agents · ${mp.total_installs||0} installs</div>
+        </div>
+        <div class="card" style="cursor:pointer" onclick="navigate('workflows')">
+          <div style="font-size:32px;margin-bottom:8px">⚙️</div>
+          <div class="card-title">Workflows</div>
+          <div class="card-subtitle">Automate with triggers & actions</div>
+        </div>
+      </div>
+    </div>`;
+  loadOverviewEvents();
 }
 
-async function createSchedule() {
-  const body = {
-    agent_type: document.getElementById('schedAgent').value,
-    task_description: document.getElementById('schedTask').value,
-    schedule: document.getElementById('schedFreq').value,
-    schedule_type: 'single'
+async function loadOverviewEvents() {
+  const el = document.getElementById('overviewEvents');
+  if (!el) return;
+  if (liveEvents.length === 0) { el.innerHTML = '<div style="color:var(--text2);font-size:13px;padding:8px">No events yet. Deploy an agent to see activity.</div>'; return; }
+  el.innerHTML = liveEvents.slice(-8).reverse().map(e => `<div class="event ${e.event_type}" style="margin-bottom:6px"><div class="event-time">${new Date(e.timestamp).toLocaleTimeString()}</div><div class="event-msg">${e.agent_name||e.agent_type}: ${(e.message||'').slice(0,100)}</div></div>`).join('');
+}
+
+// ─── DEPLOY ──────────────────────────────────────
+async function renderDeploy() {
+  const agents = await api('/api/v1/agents');
+  const models = await api('/api/v1/models/available');
+  const agentList = (agents.agents||[]).map(a => `<option value="${a.type}">${a.name} — ${a.category}</option>`).join('');
+  const modelList = (models.models||[]).map(m => `<option value="${m.model_id}">${m.provider_name}: ${m.name}</option>`).join('');
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">⚡ Deploy Agent</h2>
+      <div class="grid-2">
+        <div class="card">
+          <div class="deploy-form">
+            <div class="form-group">
+              <label class="form-label">Agent Type</label>
+              <select class="form-select" id="deployAgent">${agentList}</select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Model (optional)</label>
+              <select class="form-select" id="deployModel"><option value="">Default (Claude Haiku)</option>${modelList}</select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Task Description</label>
+              <textarea class="form-textarea" id="deployTask" placeholder="What should this agent do?"></textarea>
+            </div>
+            <button class="btn btn-primary btn-lg" onclick="deployAgent()" id="deployBtn">⚡ Deploy</button>
+            <div id="deployResult" style="margin-top:12px"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title" style="margin-bottom:12px">Recent Deploys</div>
+          <div id="recentDeploys"></div>
+        </div>
+      </div>
+    </div>`;
+  loadRecentDeploys();
+}
+
+async function deployAgent() {
+  const btn = document.getElementById('deployBtn');
+  btn.innerHTML = '<div class="spinner"></div> Deploying...';
+  btn.disabled = true;
+  const data = { agent_type: document.getElementById('deployAgent').value, task_description: document.getElementById('deployTask').value };
+  const model = document.getElementById('deployModel').value;
+  if (model) data.model = model;
+  const r = await api('/api/v1/deploy', { method: 'POST', body: JSON.stringify(data) });
+  btn.innerHTML = '⚡ Deploy';
+  btn.disabled = false;
+  const el = document.getElementById('deployResult');
+  if (r.agent_id) {
+    el.innerHTML = `<div style="background:var(--greenbg);border:1px solid var(--green);border-radius:8px;padding:12px;font-size:13px">✅ <strong>${r.agent_name}</strong> deployed<br><code style="font-size:11px">${r.agent_id}</code></div>`;
+    loadRecentDeploys();
+  } else {
+    el.innerHTML = `<div style="background:var(--redbg);border:1px solid var(--red);border-radius:8px;padding:12px;font-size:13px">❌ ${r.detail||r.error||'Deploy failed'}</div>`;
+  }
+}
+
+async function loadRecentDeploys() {
+  const el = document.getElementById('recentDeploys');
+  if (!el) return;
+  const r = await api('/api/v1/agents/recent?limit=10');
+  const agents = r.agents || [];
+  if (!agents.length) { el.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🤖</div><div class="empty-state-text">No agents deployed yet</div></div>'; return; }
+  el.innerHTML = agents.map(a => `<div class="agent-row"><div class="agent-status ${a.status}"></div><div class="agent-name">${a.agent_type}</div><div class="agent-task">${(a.task_description||'').slice(0,60)}</div><div class="agent-time">${a.status}</div></div>`).join('');
+}
+
+// ─── MY AGENTS ───────────────────────────────────
+async function renderAgents() {
+  const r = await api('/api/v1/agents/recent?limit=30');
+  const agents = r.agents || [];
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">🤖 My Agents</h2>
+      <div class="card">${agents.length ? agents.map(a => `
+        <div class="agent-row" style="cursor:pointer" onclick="showAgentResult('${a.id}')">
+          <div class="agent-status ${a.status}"></div>
+          <div class="agent-name">${a.agent_type}</div>
+          <div class="agent-task">${(a.task_description||'').slice(0,80)}</div>
+          <div class="agent-time">${a.status}</div>
+        </div>`).join('') : '<div class="empty-state"><div class="empty-state-icon">🤖</div><div class="empty-state-text">No agents yet. Deploy one!</div><button class="btn btn-primary" onclick="navigate(\'deploy\')">Deploy Agent</button></div>'}</div>
+    </div>`;
+}
+
+async function showAgentResult(id) {
+  const r = await api('/api/v1/status/' + id);
+  if (!r.result) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  overlay.innerHTML = `<div class="modal"><div class="modal-title">${r.agent_type} — Result</div><div style="color:var(--text2);font-size:12px;margin-bottom:12px">Status: ${r.status}</div><div style="white-space:pre-wrap;font-size:14px;line-height:1.6;max-height:60vh;overflow-y:auto">${(r.result||'').replace(/</g,'&lt;')}</div><button class="btn btn-secondary" style="margin-top:16px" onclick="this.closest('.modal-overlay').remove()">Close</button></div>`;
+  document.body.appendChild(overlay);
+}
+
+// ─── LIVE FEED ───────────────────────────────────
+function renderFeed() {
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">📡 Live Event Feed</h2>
+      <div class="card" id="feedContainer" style="min-height:400px;max-height:70vh;overflow-y:auto">
+        ${liveEvents.length ? liveEvents.slice().reverse().map(e => `<div class="event ${e.event_type}"><div class="event-time">${new Date(e.timestamp).toLocaleTimeString()}</div><div class="event-msg"><strong>${e.agent_name||e.agent_type||'system'}</strong>: ${(e.message||'').slice(0,200)}</div></div>`).join('') : '<div class="empty-state"><div class="empty-state-icon">📡</div><div class="empty-state-text">Listening for events...</div><div class="spinner"></div></div>'}
+      </div>
+    </div>`;
+}
+
+// ─── MARKETPLACE ─────────────────────────────────
+let mpCategory = null;
+async function renderMarketplace() {
+  const [agents, cats, featured] = await Promise.all([
+    api('/api/v1/marketplace/agents' + (mpCategory ? '?category='+mpCategory : '')),
+    api('/api/v1/marketplace/categories'),
+    api('/api/v1/marketplace/featured')
+  ]);
+  const categories = cats.categories || [];
+  const starters = featured.starters || [];
+  const mpAgents = agents.agents || [];
+  const allAgents = [...mpAgents, ...(mpAgents.length === 0 ? starters.map((s,i) => ({...s, agent_id:'starter-'+i, slug:'starter-'+i, is_free:true, install_count:0, avg_rating:0, rating_count:0, creator:'APEX Team'})) : [])];
+  
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:4px">🏪 Agent Marketplace</h2>
+      <p style="color:var(--text2);margin-bottom:20px">Discover, install, and deploy community agents</p>
+      <div class="mp-category-bar">
+        <button class="mp-cat-btn ${!mpCategory?'active':''}" onclick="mpCategory=null;renderMarketplace()">All</button>
+        ${categories.map(c => `<button class="mp-cat-btn ${mpCategory===c.id?'active':''}" onclick="mpCategory='${c.id}';renderMarketplace()">${c.icon} ${c.name}</button>`).join('')}
+      </div>
+      <div class="mp-grid">
+        ${allAgents.map(a => `
+          <div class="mp-card" onclick="showMpAgent('${a.slug||a.agent_id}')">
+            <div class="mp-icon">${a.icon||'🤖'}</div>
+            <div class="mp-name">${a.name}</div>
+            <div class="mp-desc">${a.description}</div>
+            <div class="mp-meta">
+              <span class="mp-price">${a.is_free||a.price_usd<=0?'FREE':'$'+a.price_usd}</span>
+              ${a.avg_rating>0?`<span class="mp-rating">★ ${a.avg_rating.toFixed(1)}</span>`:''}
+              <span class="mp-installs">📦 ${a.install_count||0}</span>
+              <span>${a.creator||'community'}</span>
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+async function showMpAgent(slug) {
+  const a = await api('/api/v1/marketplace/agents/' + slug);
+  if (!a || a.error) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  overlay.innerHTML = `<div class="modal" style="position:relative">
+    <div style="font-size:40px;margin-bottom:12px">${a.icon||'🤖'}</div>
+    <div class="modal-title">${a.name}</div>
+    <div style="color:var(--text2);margin-bottom:16px">${a.description}</div>
+    <div style="display:flex;gap:16px;margin-bottom:16px;font-size:13px">
+      <span class="mp-price" style="font-size:16px">${a.is_free?'FREE':'$'+a.price_usd}</span>
+      <span>📦 ${a.install_count} installs</span>
+      <span>🔄 ${a.total_runs} runs</span>
+      ${a.avg_rating>0?`<span class="mp-rating">★ ${a.avg_rating} (${a.rating_count})</span>`:''}
+    </div>
+    ${a.long_description?`<div style="color:var(--text2);font-size:14px;line-height:1.6;margin-bottom:16px">${a.long_description}</div>`:''}
+    ${a.tags&&a.tags.length?`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">${a.tags.map(t=>`<span class="mp-tag">${t}</span>`).join('')}</div>`:''}
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-primary btn-lg" onclick="installMpAgent('${a.agent_id}',this)">Install Agent</button>
+      <button class="btn btn-secondary" onclick="this.closest('.modal-overlay').remove()">Close</button>
+    </div>
+    <div id="mpInstallResult" style="margin-top:12px"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+
+async function installMpAgent(id, btn) {
+  btn.innerHTML = '<div class="spinner"></div>';
+  const r = await api('/api/v1/marketplace/agents/'+id+'/install', {method:'POST'});
+  const el = document.getElementById('mpInstallResult');
+  if (r.install_id) { el.innerHTML = `<div style="color:var(--green)">✅ Installed! Deploy from My Agents.</div>`; }
+  else { el.innerHTML = `<div style="color:var(--red)">❌ ${r.detail||r.error||'Failed'}</div>`; }
+  btn.innerHTML = 'Install Agent';
+}
+
+// ─── CREATE AGENT ────────────────────────────────
+function renderCreateAgent() {
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">🛠️ Create Custom Agent</h2>
+      <div class="grid-2">
+        <div class="card">
+          <div class="deploy-form">
+            <div class="form-group"><label class="form-label">Agent Name</label><input class="form-input" id="caName" placeholder="e.g. Alpha Scanner"></div>
+            <div class="form-group"><label class="form-label">Icon</label><input class="form-input" id="caIcon" value="🤖" style="width:60px;text-align:center;font-size:24px"></div>
+            <div class="form-group"><label class="form-label">Short Description</label><input class="form-input" id="caDesc" placeholder="One line about what it does"></div>
+            <div class="form-group"><label class="form-label">Category</label>
+              <select class="form-select" id="caCat"><option>Crypto & DeFi</option><option>Coding & Dev</option><option>Writing & Content</option><option>Data & Research</option><option>Business & Strategy</option><option>Productivity</option></select>
+            </div>
+            <div class="form-group"><label class="form-label">System Prompt</label><textarea class="form-textarea" id="caPrompt" style="min-height:180px" placeholder="You are an expert at..."></textarea></div>
+            <div class="form-group"><label class="form-label">Price (USD) — 0 = free</label><input class="form-input" id="caPrice" type="number" value="0" min="0" step="0.99"></div>
+            <div class="form-group"><label class="form-label">Creator Name</label><input class="form-input" id="caCreator" placeholder="Your name or handle"></div>
+            <button class="btn btn-primary btn-lg" onclick="createMpAgent()">Create Agent</button>
+            <div id="caResult" style="margin-top:12px"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title" style="margin-bottom:12px">Tips</div>
+          <div style="color:var(--text2);font-size:14px;line-height:1.8">
+            <p>📝 <strong>System prompt</strong> is the soul of your agent. Be specific about expertise, output format, and behavior.</p><br>
+            <p>💰 <strong>Pricing</strong>: Free agents get more installs. Paid agents earn you 80% of each sale.</p><br>
+            <p>🏷️ <strong>After creating</strong>, publish it to make it visible in the marketplace.</p>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function createMpAgent() {
+  const data = {
+    name: document.getElementById('caName').value,
+    description: document.getElementById('caDesc').value,
+    system_prompt: document.getElementById('caPrompt').value,
+    category: document.getElementById('caCat').value,
+    icon: document.getElementById('caIcon').value,
+    price_usd: parseFloat(document.getElementById('caPrice').value) || 0,
+    creator_name: document.getElementById('caCreator').value || 'anonymous',
   };
-  if (!body.task_description) return alert('Enter a task description');
-  await fetch(API + '/api/v1/schedules', { method: 'POST', headers: headers(), body: JSON.stringify(body) });
-  document.getElementById('schedTask').value = '';
-  loadSchedules();
-}
-
-async function toggleSched(id, el) {
-  await fetch(API + '/api/v1/schedules/' + id + '/toggle', { method: 'PUT', headers: headers() });
-  el.classList.toggle('on');
-}
-
-async function deleteSched(id) {
-  if (!confirm('Delete this schedule?')) return;
-  await fetch(API + '/api/v1/schedules/' + id, { method: 'DELETE', headers: headers() });
-  loadSchedules();
-}
-
-// ─── Modal / Deploy ───
-function openDeploy(type, id, name, desc) {
-  currentDeploy = { type, id };
-  document.getElementById('modalTitle').textContent = name;
-  document.getElementById('modalDesc').textContent = desc;
-  document.getElementById('modalTask').value = '';
-  document.getElementById('deployModal').classList.add('show');
-  document.getElementById('modalTask').focus();
-}
-function closeModal() { document.getElementById('deployModal').classList.remove('show'); }
-
-async function deployFromModal() {
-  const task = document.getElementById('modalTask').value;
-  if (!task) return alert('Enter a task description');
-  closeModal();
-
-  let endpoint, body, resultPanel, resultTitle, resultText;
-
-  if (currentDeploy.type === 'agent') {
-    endpoint = '/api/v1/deploy';
-    body = { agent_type: currentDeploy.id, task_description: task };
-    resultPanel = 'resultPanel';
-  } else if (currentDeploy.type === 'pipeline') {
-    endpoint = '/api/v1/chains/deploy';
-    body = { pipeline_id: currentDeploy.id, task_description: task };
-    resultPanel = 'pipelineResult';
-  } else if (currentDeploy.type === 'collab') {
-    endpoint = '/api/v1/collab/deploy';
-    body = { collab_id: currentDeploy.id, task_description: task };
-    resultPanel = 'collabResult';
-  }
-
-  try {
-    const r = await fetch(API + endpoint, { method: 'POST', headers: headers(), body: JSON.stringify(body) });
-    const d = await r.json();
-    const id = d.agent_id || d.chain_id || d.collab_id;
-
-    const panel = document.getElementById(resultPanel);
-    panel.classList.add('show');
-
-    if (resultPanel === 'resultPanel') {
-      document.getElementById('resultAgent').textContent = d.agent_name || currentDeploy.id;
-      document.getElementById('resultStatus').textContent = 'Running...';
-      document.getElementById('resultStatus').className = 'result-status status-running';
-      document.getElementById('resultText').innerHTML = 'Agent is working...';
-    } else {
-      const titleEl = panel.querySelector('strong');
-      const textEl = panel.querySelector('.result-text');
-      if (titleEl) titleEl.textContent = d.pipeline || d.collab_name || 'Running...';
-      if (textEl) textEl.innerHTML = 'Processing...';
-    }
-
-    pollResult(id, resultPanel);
-  } catch(e) {
-    alert('Deploy failed: ' + e.message);
+  const r = await api('/api/v1/marketplace/agents', {method:'POST', body:JSON.stringify(data)});
+  const el = document.getElementById('caResult');
+  if (r.agent_id) {
+    el.innerHTML = `<div style="background:var(--greenbg);border:1px solid var(--green);border-radius:8px;padding:12px">✅ Created! <strong>${r.slug}</strong><br><button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="publishAgent('${r.agent_id}',this)">Publish to Marketplace</button></div>`;
+  } else {
+    el.innerHTML = `<div style="color:var(--red)">❌ ${r.detail||r.error||'Failed'}</div>`;
   }
 }
 
-async function pollResult(id, panelId) {
-  const maxPolls = 120;
-  for (let i = 0; i < maxPolls; i++) {
-    await new Promise(r => setTimeout(r, 2000));
-    try {
-      const r = await fetch(API + '/api/v1/status/' + id, { headers: headers() });
-      if (!r.ok) continue;
-      const d = await r.json();
-      if (d.status === 'running') continue;
-
-      if (panelId === 'resultPanel') {
-        document.getElementById('resultStatus').textContent = d.status;
-        document.getElementById('resultStatus').className = 'result-status status-' + d.status;
-        document.getElementById('resultText').innerHTML = renderMarkdown(d.result || 'No result');
-      } else {
-        const panel = document.getElementById(panelId);
-        const textEl = panel.querySelector('.result-text');
-        if (textEl) textEl.innerHTML = renderMarkdown(d.result || 'No result');
-      }
-      return;
-    } catch(e) { /* retry */ }
-  }
+async function publishAgent(id, btn) {
+  btn.innerHTML = '<div class="spinner"></div>';
+  await api('/api/v1/marketplace/agents/'+id+'/publish', {method:'POST'});
+  btn.innerHTML = '✅ Published!';
+  btn.disabled = true;
 }
 
-function renderMarkdown(text) {
-  if (!text) return '';
-  return text
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    .replace(/\n/g, '<br>');
+// ─── MY STORE ────────────────────────────────────
+async function renderMyStore() {
+  const [agents, earnings] = await Promise.all([api('/api/v1/marketplace/my-agents'), api('/api/v1/marketplace/earnings')]);
+  const myAgents = agents.agents || [];
+  const e = earnings || {};
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">💰 My Store</h2>
+      <div class="grid-3" style="margin-bottom:24px">
+        <div class="stat"><div class="stat-value">$${(e.total_earned||0).toFixed(2)}</div><div class="stat-label">Total Earned</div></div>
+        <div class="stat"><div class="stat-value">${e.total_sales||0}</div><div class="stat-label">Total Sales</div></div>
+        <div class="stat"><div class="stat-value">${myAgents.length}</div><div class="stat-label">My Agents</div></div>
+      </div>
+      <div class="card">${myAgents.length ? myAgents.map(a => `
+        <div class="agent-row">
+          <span style="font-size:20px">${a.icon||'🤖'}</span>
+          <div class="agent-name">${a.name}</div>
+          <span style="font-size:12px;color:var(--text2)">📦${a.install_count} ★${a.avg_rating||0}</span>
+          <span style="font-size:12px;color:${a.published?'var(--green)':'var(--text2)'}">${a.published?'Published':'Draft'}</span>
+          ${!a.published?`<button class="btn btn-primary btn-sm" onclick="publishAgent('${a.agent_id}',this)">Publish</button>`:''}
+        </div>`).join('') : '<div class="empty-state"><div class="empty-state-icon">🛠️</div><div class="empty-state-text">No agents yet</div><button class="btn btn-primary" onclick="navigate(\'create-agent\')">Create Agent</button></div>'}</div>
+    </div>`;
 }
 
-// ─── God Eye ───
-let sseSource = null;
-let sseConnected = false;
-
-function toggleSSE() {
-  if (sseConnected) { disconnectSSE(); } else { connectSSE(); }
+// ─── WORKFLOWS ───────────────────────────────────
+async function renderWorkflows() {
+  const [wfs, templates] = await Promise.all([api('/api/v1/workflows'), api('/api/v1/workflows/templates')]);
+  const workflows = wfs.workflows || [];
+  const tmpls = templates.templates || {};
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">⚙️ Workflows</h2>
+      <div style="margin-bottom:20px"><h3 style="font-size:16px;margin-bottom:12px;color:var(--text2)">Quick Start Templates</h3>
+        <div class="grid-3">${Object.entries(tmpls).map(([id,t])=>`
+          <div class="card" style="cursor:pointer" onclick="createWorkflow('${id}')">
+            <div class="card-title" style="font-size:14px">${t.name}</div>
+            <div class="card-subtitle">${t.description}</div>
+            <div style="margin-top:8px;font-size:11px;color:var(--green)">Trigger: ${t.trigger_type}</div>
+          </div>`).join('')}</div>
+      </div>
+      <h3 style="font-size:16px;margin-bottom:12px">Active Workflows</h3>
+      <div class="card">${workflows.length ? workflows.map(w => `
+        <div class="agent-row">
+          <div class="agent-status ${w.enabled?'running':'failed'}"></div>
+          <div class="agent-name">${w.name}</div>
+          <div style="font-size:12px;color:var(--text2)">${w.trigger_type} → ${w.fire_count} fires</div>
+          <button class="btn btn-sm btn-secondary" onclick="toggleWorkflow('${w.workflow_id}')">Toggle</button>
+        </div>`).join('') : '<div style="color:var(--text2);padding:16px;text-align:center">No workflows. Use a template above to get started.</div>'}</div>
+    </div>`;
 }
 
+async function createWorkflow(templateId) {
+  const r = await api('/api/v1/workflows', {method:'POST', body:JSON.stringify({name:'',trigger_type:'',actions:[],template_id:templateId})});
+  if (r.workflow_id) renderWorkflows();
+}
+
+async function toggleWorkflow(id) {
+  await api('/api/v1/workflows/'+id+'/toggle', {method:'POST'});
+  renderWorkflows();
+}
+
+// ─── DAEMONS ─────────────────────────────────────
+async function renderDaemons() {
+  const r = await api('/api/v1/daemons');
+  const daemons = r.daemons || [];
+  const presets = r.presets || {};
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">👁️ Daemons — 24/7 Monitors</h2>
+      <div class="grid-3" style="margin-bottom:20px">${Object.entries(presets).map(([id,p])=>`
+        <div class="card" style="cursor:pointer" onclick="startDaemon('${id}')">
+          <div class="card-title" style="font-size:14px">${p.name}</div>
+          <div class="card-subtitle">${(p.task_description||'').slice(0,80)}</div>
+          <div style="margin-top:8px;font-size:11px;color:var(--text2)">Every ${p.interval_seconds}s</div>
+        </div>`).join('')}</div>
+      <h3 style="font-size:16px;margin-bottom:12px">Running Daemons</h3>
+      <div class="card">${daemons.length ? daemons.map(d => `
+        <div class="agent-row">
+          <div class="agent-status ${d.status==='running'?'running':'failed'}"></div>
+          <div class="agent-name">${d.agent_name}</div>
+          <div style="font-size:12px;color:var(--text2)">${d.cycles} cycles</div>
+          <button class="btn btn-danger btn-sm" onclick="stopDaemon('${d.daemon_id}')">Stop</button>
+        </div>`).join('') : '<div style="color:var(--text2);padding:16px;text-align:center">No daemons running. Click a preset above to start.</div>'}</div>
+    </div>`;
+}
+
+async function startDaemon(id) { await api('/api/v1/daemons/start', {method:'POST', body:JSON.stringify({preset_id:id})}); renderDaemons(); }
+async function stopDaemon(id) { await api('/api/v1/daemons/'+id+'/stop', {method:'POST'}); renderDaemons(); }
+
+// ─── MODELS ──────────────────────────────────────
+async function renderModels() {
+  const r = await api('/api/v1/models');
+  const providers = r.providers || [];
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">🧠 AI Models — ${r.available_count||1} Providers Active</h2>
+      <div style="display:flex;flex-direction:column;gap:16px">${providers.map(p => `
+        <div class="card">
+          <div class="card-header"><div><div class="card-title">${p.name} ${p.available?'🟢':'🔴'}</div><div class="card-subtitle">${p.available?'Connected':'Add '+p.provider.toUpperCase()+'_API_KEY to enable'}</div></div></div>
+          ${p.available?`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px">${p.models.map(m=>`<div style="background:var(--surface2);padding:10px;border-radius:8px;font-size:13px"><strong>${m.name}</strong>${m.vision?' 👁️':''}<br><span style="color:var(--text2);font-size:11px">${m.context_window.toLocaleString()} ctx · $${m.cost_per_1m_input}/M in</span></div>`).join('')}</div>`:''}
+        </div>`).join('')}</div>
+    </div>`;
+}
+
+// ─── CHANNELS ────────────────────────────────────
+async function renderChannels() {
+  const r = await api('/api/v1/channels');
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">💬 Messaging Channels</h2>
+      <div class="grid-3">${Object.entries(r||{}).map(([name,info])=>`
+        <div class="card"><div style="font-size:32px;margin-bottom:8px">${name==='telegram'?'📱':name==='discord'?'🎮':'💼'}</div>
+        <div class="card-title">${name.charAt(0).toUpperCase()+name.slice(1)}</div>
+        <div style="margin-top:8px;font-size:13px;color:${info.enabled?'var(--green)':'var(--text2)'}">${info.enabled?'✅ Connected':'❌ Not configured'}</div>
+        ${!info.enabled?`<div style="margin-top:8px;font-size:12px;color:var(--text2)">Add ${name.toUpperCase()}_BOT_TOKEN to enable</div>`:''}</div>`).join('')}</div>
+    </div>`;
+}
+
+// ─── SCHEDULES ───────────────────────────────────
+async function renderSchedules() {
+  const r = await api('/api/v1/schedules');
+  const schedules = r.schedules || [];
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">🕐 Schedules</h2>
+      <div class="card">${schedules.length ? schedules.map(s => `
+        <div class="agent-row">
+          <div class="agent-status ${s.enabled?'running':'failed'}"></div>
+          <div class="agent-name">${s.agent_type}</div>
+          <div style="font-size:12px;color:var(--text2);font-family:'Space Mono',monospace">${s.cron_expression}</div>
+          <div style="font-size:12px;color:var(--text2)">Next: ${s.next_run||'—'}</div>
+        </div>`).join('') : '<div class="empty-state"><div class="empty-state-icon">🕐</div><div class="empty-state-text">No schedules configured</div></div>'}</div>
+    </div>`;
+}
+
+// ─── SETTINGS ────────────────────────────────────
+async function renderSettings() {
+  const h = await api('/api/v1/health');
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:20px">⚙️ Settings</h2>
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-title" style="margin-bottom:12px">System Info</div>
+        <div style="font-family:'Space Mono',monospace;font-size:13px;color:var(--text2);line-height:2">
+          Version: ${h.version||'?'}<br>
+          Database: ${h.database||'?'}<br>
+          Auth: ${h.auth||'?'}<br>
+          API URL: ${BASE_URL}<br>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title" style="margin-bottom:12px">API Key</div>
+        <div class="form-group">
+          <input class="form-input" id="settingsKey" value="${API_KEY}" style="font-family:'Space Mono',monospace;font-size:12px">
+          <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="API_KEY=document.getElementById('settingsKey').value;localStorage.setItem('apex_api_key',API_KEY)">Save</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ─── SSE LIVE EVENTS ─────────────────────────────
 function connectSSE() {
-  if (sseSource) sseSource.close();
-  sseSource = new EventSource(API + '/api/v1/events/stream');
-  sseSource.onopen = () => {
-    sseConnected = true;
-    const btn = document.getElementById('sseToggle');
-    if (btn) { btn.style.background = 'var(--success)'; btn.textContent = '● Connected'; }
-  };
-  sseSource.onerror = () => {
-    sseConnected = false;
-    const btn = document.getElementById('sseToggle');
-    if (btn) { btn.style.background = 'var(--danger)'; btn.textContent = '○ Disconnected'; }
-  };
-  sseSource.addEventListener('agent.started', (e) => addFeedEvent(JSON.parse(e.data), '🚀'));
-  sseSource.addEventListener('agent.completed', (e) => addFeedEvent(JSON.parse(e.data), '✅'));
-  sseSource.addEventListener('agent.failed', (e) => addFeedEvent(JSON.parse(e.data), '❌'));
-  sseSource.addEventListener('tool.called', (e) => addFeedEvent(JSON.parse(e.data), '🔧'));
-  sseSource.addEventListener('daemon.started', (e) => addFeedEvent(JSON.parse(e.data), '👁️'));
-  sseSource.addEventListener('daemon.cycle', (e) => addFeedEvent(JSON.parse(e.data), '🔄'));
-  sseSource.addEventListener('daemon.alert', (e) => addFeedEvent(JSON.parse(e.data), '🚨'));
-  sseSource.addEventListener('daemon.stopped', (e) => addFeedEvent(JSON.parse(e.data), '⏹️'));
-  sseSource.addEventListener('chain.started', (e) => addFeedEvent(JSON.parse(e.data), '🔗'));
-  sseSource.addEventListener('chain.completed', (e) => addFeedEvent(JSON.parse(e.data), '🏁'));
-  sseSource.addEventListener('schedule.fired', (e) => addFeedEvent(JSON.parse(e.data), '⏰'));
-  sseSource.addEventListener('connected', () => addFeedEvent({message:'God-eye connected',timestamp:new Date().toISOString()}, '📡'));
-}
-
-function disconnectSSE() {
-  if (sseSource) sseSource.close();
-  sseConnected = false;
-  const btn = document.getElementById('sseToggle');
-  if (btn) { btn.style.background = 'var(--border)'; btn.textContent = '○ Disconnected'; }
-}
-
-function addFeedEvent(data, icon) {
-  const feed = document.getElementById('eventFeed');
-  if (!feed) return;
-  const time = data.timestamp ? new Date(data.timestamp).toLocaleTimeString() : '';
-  const name = data.agent_name || data.agent_type || '';
-  const msg = data.message || data.event_type || '';
-  const el = document.createElement('div');
-  el.style.cssText = 'padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:12px;';
-  el.innerHTML = '<span style="opacity:0.5">' + time + '</span> ' + icon + ' <strong>' + name + '</strong> ' + msg.substring(0,120);
-  // If alert, highlight
-  if (data.event_type === 'daemon.alert') el.style.borderColor = 'var(--danger)';
-  feed.prepend(el);
-  // Keep feed manageable
-  while (feed.children.length > 100) feed.removeChild(feed.lastChild);
-  // Update stats
-  refreshGodEye();
-}
-
-async function refreshGodEye() {
-  try {
-    const r = await fetch(API + '/api/v1/god-eye');
-    const d = await r.json();
-    const ge = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-    ge('geActiveAgents', (d.live?.active_agents || d.db?.running || 0));
-    ge('geActiveDaemons', d.live?.active_daemons || 0);
-    ge('geTotalEvents', d.live?.total_events || 0);
-  } catch(e) {}
-}
-
-async function loadDaemons() {
-  try {
-    // Load presets into dropdown
-    const pr = await fetch(API + '/api/v1/daemons/presets');
-    const presets = await pr.json();
-    const sel = document.getElementById('daemonPreset');
-    if (sel && presets.presets) {
-      sel.innerHTML = '<option value="">Select preset...</option>';
-      for (const [id, p] of Object.entries(presets.presets)) {
-        sel.innerHTML += '<option value="' + id + '">' + p.name + ' (' + p.interval + 's)</option>';
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource(BASE_URL + '/api/v1/events/stream');
+  eventSource.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.event_type) {
+        liveEvents.push(data);
+        if (liveEvents.length > 100) liveEvents.shift();
+        if (currentPage === 'feed') renderFeed();
+        if (currentPage === 'overview') loadOverviewEvents();
       }
-    }
-
-    // Load active daemons
-    const dr = await fetch(API + '/api/v1/daemons', { headers: headers() });
-    const data = await dr.json();
-    const list = document.getElementById('daemonList');
-    if (!list) return;
-    if (!data.daemons || data.daemons.length === 0) {
-      list.innerHTML = '<div class="empty-state" style="padding:30px"><div class="icon">👁️</div><p>No daemons running</p></div>';
-      return;
-    }
-    let html = '';
-    for (const d of data.daemons) {
-      const statusColor = d.status === 'running' ? 'var(--success)' : 'var(--danger)';
-      html += '<div class="schedule-row">' +
-        '<div class="schedule-info">' +
-          '<div class="sched-agent" style="color:' + statusColor + '">' + (d.status === 'running' ? '🟢' : '🔴') + ' ' + d.agent_name + '</div>' +
-          '<div class="sched-task">' + (d.task || '').substring(0,80) + '</div>' +
-          '<div class="sched-cron">Cycles: ' + d.cycles + ' | Every ' + d.interval_seconds + 's | ID: ' + d.daemon_id.substring(0,8) + '</div>' +
-        '</div>' +
-        '<div class="schedule-actions">' +
-          (d.status === 'running' ? '<button class="btn btn-danger btn-sm" onclick="stopDaemon(\'' + d.daemon_id + '\')">Stop</button>' : '') +
-        '</div>' +
-      '</div>';
-    }
-    list.innerHTML = html;
-  } catch(e) { console.error(e); }
+    } catch(err) {}
+  };
+  eventSource.onerror = () => {
+    document.getElementById('statusDot').style.background = 'var(--red)';
+    document.getElementById('statusText').textContent = 'Disconnected';
+    setTimeout(connectSSE, 5000);
+  };
+  eventSource.onopen = () => {
+    document.getElementById('statusDot').style.background = 'var(--green)';
+    document.getElementById('statusText').textContent = 'Connected';
+  };
 }
 
-async function startDaemon() {
-  const presetId = document.getElementById('daemonPreset').value;
-  if (!presetId) return alert('Select a daemon preset');
-  try {
-    await fetch(API + '/api/v1/daemons', {
-      method: 'POST', headers: headers(),
-      body: JSON.stringify({ preset_id: presetId })
-    });
-    loadDaemons();
-  } catch(e) { alert('Failed: ' + e.message); }
-}
-
-async function stopDaemon(id) {
-  if (!confirm('Stop this daemon?')) return;
-  await fetch(API + '/api/v1/daemons/' + id, { method: 'DELETE', headers: headers() });
-  loadDaemons();
-}
-
-// ─── Init ───
-checkHealth();
-loadAgents();
+// ─── INIT ────────────────────────────────────────
+document.getElementById('apiKeyInput').value = API_KEY;
+connectSSE();
+navigate('overview');
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 # ─── ENTRYPOINT ───────────────────────────────────────────
