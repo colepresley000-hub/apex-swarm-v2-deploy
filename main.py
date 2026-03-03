@@ -44,7 +44,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 DATABASE_PATH = os.getenv("DATABASE_PATH", "apex_swarm.db")
 PORT = int(os.getenv("PORT", "8080"))
-VERSION = "3.4.0"
+VERSION = "4.0.0"
 
 # ─── OPTIONAL MODULE IMPORTS (graceful degradation) ───────
 
@@ -53,7 +53,7 @@ CHAINS_AVAILABLE = False
 MISSION_CONTROL = False
 
 try:
-    from agent_tools import execute_with_tools, get_tools_for_agent, set_mcp_registry, get_mcp_tool_definitions
+    from agent_tools import execute_with_tools, get_tools_for_agent, set_mcp_registry, get_mcp_tool_definitions, set_model_router
     TOOLS_AVAILABLE = True
     logger.info("✅ agent_tools loaded — agents have real capabilities")
 except ImportError:
@@ -119,6 +119,46 @@ try:
 except ImportError:
     WORKFLOW_TEMPLATES = {}
     logger.warning("⚠️ workflow_engine not found — no workflow automation")
+
+# Multi-model router
+MULTI_MODEL = False
+model_router = None
+try:
+    from multi_model import ModelRouter, PROVIDERS, model_router as _mr
+    MULTI_MODEL = True
+    model_router = _mr
+    logger.info("✅ multi_model loaded — 9 providers, 30+ models available")
+except ImportError:
+    PROVIDERS = {}
+    logger.warning("⚠️ multi_model not found — Anthropic-only mode")
+
+# Unified channels (Telegram + Discord + Slack)
+CHANNELS_LOADED = False
+try:
+    from channels import (
+        command_router, discord_gateway, send_telegram, send_discord, send_slack,
+        send_to_channel, parse_telegram_webhook, parse_discord_webhook, parse_slack_webhook,
+        setup_telegram_webhook, get_channel_status,
+        TELEGRAM_ENABLED, DISCORD_ENABLED, SLACK_ENABLED,
+    )
+    CHANNELS_LOADED = True
+    logger.info("✅ channels loaded — Telegram/Discord/Slack")
+except ImportError:
+    TELEGRAM_ENABLED = bool(os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    DISCORD_ENABLED = False
+    SLACK_ENABLED = False
+    logger.warning("⚠️ channels not found — limited messaging")
+
+# Agent Marketplace
+MARKETPLACE_AVAILABLE = False
+marketplace = None
+try:
+    from marketplace import Marketplace, STARTER_AGENTS
+    MARKETPLACE_AVAILABLE = True
+    logger.info("✅ marketplace loaded — agent store, revenue sharing, skill packs")
+except ImportError:
+    STARTER_AGENTS = []
+    logger.warning("⚠️ marketplace not found — no agent store")
 
 # Smart knowledge (optional)
 SMART_KNOWLEDGE = False
@@ -224,9 +264,41 @@ AGENT_CATEGORIES = {
             "decision-helper": {"name": "Decision Helper", "description": "Structured decision-making frameworks", "system": "You are a decision-making facilitator. Use frameworks (pros/cons, SWOT, decision matrix) to help make informed, structured decisions."},
             "learning-coach": {"name": "Learning Coach", "description": "Personalized learning plans and study strategies", "system": "You are a learning optimization expert. Create personalized study plans, explain concepts clearly, and use spaced repetition and active recall techniques."},
             "negotiation-coach": {"name": "Negotiation Coach", "description": "Negotiation strategies and preparation", "system": "You are a negotiation expert. Prepare strategies, BATNA analysis, opening positions, and tactical advice for any negotiation scenario."},
-            "automation-builder": {"name": "Automation Builder", "description": "Design no-code/low-code automations and agent workflows", "system": "You are an automation architect. Design workflows connecting APIs, tools, and AI agents using platforms like Make, Zapier, n8n, or custom pipelines. Map triggers, conditions, and actions. Build systems where agents autonomously handle recurring tasks — from data collection to report generation to notifications."},
-            "workflow-optimizer": {"name": "Workflow Optimizer", "description": "Analyze and optimize business processes with AI agents", "system": "You are a workflow optimization specialist focused on AI agent integration. Audit existing business processes, identify bottlenecks, and design agent-augmented workflows that reduce manual work by 10x. Map which tasks should be fully autonomous, which need human-in-the-loop, and which need multi-agent collaboration. Create implementation roadmaps for agent adoption."},
-            "prompt-engineer": {"name": "Prompt Engineer", "description": "Craft and optimize prompts and system instructions for AI agents", "system": "You are an expert prompt engineer. Design, test, and optimize system prompts, tool definitions, and instruction sets for AI agents and LLMs. You understand token efficiency, chain-of-thought elicitation, few-shot patterns, output formatting, guardrails, and how to get consistent high-quality results from Claude, GPT, and other models. Turn vague requirements into precise, high-performing prompts."},
+            "automation-builder": {"name": "Automation Builder", "description": "Design no-code/low-code automations and agent workflows", "system": "You are an automation architect. Design workflows connecting APIs, tools, and AI agents using platforms like Make, Zapier, n8n, or custom pipelines. Map triggers, conditions, and actions."},
+            "workflow-optimizer": {"name": "Workflow Optimizer", "description": "Analyze and optimize business processes with AI agents", "system": "You are a workflow optimization specialist focused on AI agent integration. Audit existing business processes, identify bottlenecks, and design agent-augmented workflows that reduce manual work by 10x."},
+            "prompt-engineer": {"name": "Prompt Engineer", "description": "Craft and optimize prompts and system instructions for AI agents", "system": "You are an expert prompt engineer. Design, test, and optimize system prompts, tool definitions, and instruction sets for AI agents and LLMs."},
+        },
+    },
+    "DevOps & Monitoring": {
+        "icon": "🔧",
+        "agents": {
+            "uptime-monitor": {"name": "Uptime Monitor", "description": "Monitor endpoints and APIs for uptime and response time", "system": "You are an uptime monitoring specialist. Check HTTP endpoints, measure response times, detect outages, and generate status reports. Use json_api and web_search tools to verify service health. Recommend fixes for common failure patterns."},
+            "log-analyzer": {"name": "Log Analyzer", "description": "Analyze application logs for errors, patterns, and anomalies", "system": "You are a log analysis expert. Parse application logs, identify error patterns, detect anomalies, correlate events, and provide root cause analysis. Prioritize by severity and frequency."},
+            "dependency-scanner": {"name": "Dependency Scanner", "description": "Scan project dependencies for vulnerabilities and updates", "system": "You are a dependency security expert. Check package registries for known CVEs, outdated versions, and license risks. Recommend upgrade paths and security patches."},
+            "infra-cost-analyzer": {"name": "Infrastructure Cost Analyst", "description": "Analyze and optimize cloud infrastructure costs", "system": "You are a cloud cost optimization expert. Analyze cloud spending across AWS, GCP, Azure. Identify idle resources, right-sizing opportunities, reserved instance savings, and architectural changes that reduce costs."},
+            "api-tester": {"name": "API Tester", "description": "Test API endpoints for correctness, performance, and edge cases", "system": "You are an API testing specialist. Use json_api tool to test endpoints. Verify response codes, data formats, error handling, auth flows, and edge cases. Generate test reports with pass/fail status."},
+            "release-manager": {"name": "Release Manager", "description": "Coordinate releases, changelogs, and deployment plans", "system": "You are a release management expert. Create structured release plans, generate changelogs from commit history, coordinate deployment steps, rollback procedures, and stakeholder communications."},
+        },
+    },
+    "Intelligence & OSINT": {
+        "icon": "🕵️",
+        "agents": {
+            "social-listener": {"name": "Social Listener", "description": "Monitor social media for brand mentions, sentiment, and trends", "system": "You are a social media intelligence analyst. Monitor Twitter/X, Reddit, HackerNews, and forums for brand mentions, sentiment shifts, and viral trends. Use web_search and rss_feed tools. Analyze sentiment with sentiment_analysis tool. Track competitor mentions and industry discourse."},
+            "patent-researcher": {"name": "Patent Researcher", "description": "Research patent filings and intellectual property landscape", "system": "You are a patent intelligence analyst. Research patent filings on Google Patents and USPTO. Identify IP trends, potential infringement risks, and white space opportunities in any technology domain."},
+            "regulatory-tracker": {"name": "Regulatory Tracker", "description": "Track regulatory changes and compliance updates", "system": "You are a regulatory intelligence specialist. Monitor government sites, Federal Register, SEC filings, and regulatory bodies for policy changes, new rules, and compliance requirements that affect businesses."},
+            "talent-scout": {"name": "Talent Scout", "description": "Research talent pools, hiring trends, and team building", "system": "You are a talent intelligence analyst. Research hiring trends, salary benchmarks, skill availability, and competitive talent landscapes using job boards, LinkedIn data, and industry reports."},
+            "supply-chain-analyst": {"name": "Supply Chain Analyst", "description": "Monitor supply chain risks and logistics intelligence", "system": "You are a supply chain intelligence analyst. Monitor shipping data, commodity prices, geopolitical risks, weather disruptions, and supplier health that could impact supply chains."},
+            "dark-web-monitor": {"name": "Threat Intel Monitor", "description": "Monitor for data breaches, leaked credentials, and threat intelligence", "system": "You are a cybersecurity threat intelligence analyst. Monitor security feeds, CVE databases, breach notification sites, and security advisories for threats relevant to an organization. Use web_search and rss_feed tools."},
+        },
+    },
+    "Sales & Growth": {
+        "icon": "📈",
+        "agents": {
+            "lead-qualifier": {"name": "Lead Qualifier", "description": "Research and qualify sales leads from company data", "system": "You are a B2B lead qualification expert. Research companies using web_search, analyze their tech stack, funding, team size, and growth signals. Score leads on ICP fit, buying intent, and timing."},
+            "pitch-writer": {"name": "Pitch Writer", "description": "Write compelling sales pitches and proposals", "system": "You are an expert sales copywriter. Craft personalized pitches, proposals, and outreach sequences tailored to the prospect's pain points, industry, and decision stage."},
+            "pricing-optimizer": {"name": "Pricing Optimizer", "description": "Analyze pricing strategies and competitive positioning", "system": "You are a pricing strategy expert. Analyze competitive pricing, willingness-to-pay signals, packaging structures, and recommend optimal pricing strategies. Use data_transform for analysis."},
+            "churn-predictor": {"name": "Churn Predictor", "description": "Analyze customer signals to predict and prevent churn", "system": "You are a customer retention analyst. Analyze usage patterns, support tickets, NPS signals, and engagement metrics to identify churn risks and recommend retention interventions."},
+            "market-sizer": {"name": "Market Sizer", "description": "Estimate TAM/SAM/SOM for market opportunities", "system": "You are a market sizing expert. Estimate Total Addressable Market, Serviceable Addressable Market, and Serviceable Obtainable Market using top-down and bottom-up methodologies with current industry data."},
         },
     },
 }
@@ -565,6 +637,11 @@ def init_db():
         finally:
             conn.close()
 
+    # Wire multi-model router into agent_tools
+    if MULTI_MODEL and TOOLS_AVAILABLE and model_router:
+        set_model_router(model_router)
+        logger.info("✅ Multi-model router wired into agent execution")
+
     # Initialize workflow engine tables
     if WORKFLOWS_AVAILABLE:
         global workflow_engine
@@ -575,6 +652,19 @@ def init_db():
             logger.info("✅ Workflow engine tables initialized")
         except Exception as e:
             logger.error(f"Workflow engine init failed: {e}")
+        finally:
+            conn.close()
+
+    # Initialize marketplace tables
+    if MARKETPLACE_AVAILABLE:
+        global marketplace
+        marketplace = Marketplace(get_db, db_execute, db_fetchall, db_fetchone, USER_KEY_COL)
+        conn = get_db()
+        try:
+            marketplace.init_tables(conn)
+            logger.info("✅ Marketplace tables initialized")
+        except Exception as e:
+            logger.error(f"Marketplace init failed: {e}")
         finally:
             conn.close()
 
@@ -781,6 +871,8 @@ async def restore_daemons():
 class DeployRequest(BaseModel):
     agent_type: str
     task_description: str
+    model: Optional[str] = None  # e.g. "gpt-4o", "gemini-2.5-flash", "groq/llama-3.3-70b-versatile"
+    image_url: Optional[str] = None  # URL of image for vision tasks
 
 class KnowledgeRequest(BaseModel):
     agent_type: str
@@ -866,9 +958,29 @@ def get_knowledge_for_agent(user_api_key: str, agent_type: str, task: str = "") 
 
 # ─── CORE EXECUTION ──────────────────────────────────────
 
-async def execute_task(agent_id: str, agent_type: str, task_description: str, user_api_key: str = "system"):
-    """Execute a single agent task. Uses tools when available, falls back to single-call."""
-    if agent_type not in AGENTS:
+async def execute_task(agent_id: str, agent_type: str, task_description: str, user_api_key: str = "system", model: str = None, image_data: str = None, image_media_type: str = "image/jpeg"):
+    """Execute a single agent task. Supports built-in + marketplace agents."""
+    marketplace_agent = None
+
+    # Check if it's a marketplace agent (format: mp:slug or mp:agent_id)
+    if agent_type.startswith("mp:") and MARKETPLACE_AVAILABLE and marketplace:
+        mp_ref = agent_type[3:]
+        marketplace_agent = await marketplace.get_agent_detail(mp_ref)
+        if not marketplace_agent:
+            conn = get_db()
+            try:
+                conn.execute(
+                    "UPDATE agents SET status = 'failed', result = ?, completed_at = ? WHERE id = ?",
+                    (f"Marketplace agent not found: {mp_ref}", datetime.now(timezone.utc).isoformat(), agent_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return
+        # Record the run
+        await marketplace.record_run(marketplace_agent["agent_id"], user_api_key)
+
+    elif agent_type not in AGENTS:
         conn = get_db()
         try:
             conn.execute(
@@ -880,9 +992,18 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
             conn.close()
         return
 
-    agent = AGENTS[agent_type]
-    category = AGENT_TO_CATEGORY.get(agent_type, "Productivity")
-    system_prompt = agent["system"]
+    # Resolve agent config — marketplace or built-in
+    if marketplace_agent:
+        agent = {"name": marketplace_agent["name"], "system": marketplace_agent["system_prompt"]}
+        category = marketplace_agent.get("category", "Productivity")
+        system_prompt = marketplace_agent["system_prompt"]
+        # Use marketplace agent's model preference if set and no override
+        if not model and marketplace_agent.get("model_preference"):
+            model = marketplace_agent["model_preference"]
+    else:
+        agent = AGENTS[agent_type]
+        category = AGENT_TO_CATEGORY.get(agent_type, "Productivity")
+        system_prompt = agent["system"]
 
     # Emit started event
     if MISSION_CONTROL:
@@ -930,15 +1051,19 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
 
         if TOOLS_AVAILABLE:
             tools = get_tools_for_agent(category)
+            # Use requested model, or env default, or auto-select
+            selected_model = model or CLAUDE_MODEL
             result = await execute_with_tools(
                 api_key=ANTHROPIC_API_KEY,
-                model=CLAUDE_MODEL,
+                model=selected_model,
                 system_prompt=system_prompt,
                 user_message=task_description,
                 tools=tools,
                 max_turns=5,
                 user_api_key=user_api_key,
                 mcp_tools=user_mcp_tools,
+                image_data=image_data,
+                image_media_type=image_media_type,
             )
         else:
             # Legacy single-call mode
@@ -1366,6 +1491,26 @@ async def lifespan(app: FastAPI):
         event_bus.set_telegram(send_fn=send_telegram, verbosity="important")
         logger.info("📡 Event bus → Telegram forwarding active")
 
+    # Wire unified channels
+    if CHANNELS_LOADED:
+        command_router.setup(
+            agents=AGENTS,
+            agent_to_category=AGENT_TO_CATEGORY,
+            execute_fn=execute_task,
+            event_bus=event_bus if MISSION_CONTROL else None,
+            daemon_manager=daemon_manager if MISSION_CONTROL else None,
+            daemon_presets=DAEMON_PRESETS if MISSION_CONTROL else {},
+            daemon_execute_fn=_daemon_execute_fn if MISSION_CONTROL else None,
+            get_db=get_db,
+            user_key_col=USER_KEY_COL,
+        )
+        channels_active = []
+        if TELEGRAM_ENABLED: channels_active.append("Telegram")
+        if DISCORD_ENABLED: channels_active.append("Discord")
+        if SLACK_ENABLED: channels_active.append("Slack")
+        if channels_active:
+            logger.info(f"💬 Channels active: {', '.join(channels_active)}")
+
     # Restore persistent daemons
     await restore_daemons()
 
@@ -1439,7 +1584,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"🚀 APEX SWARM v{VERSION} starting ({db_type})")
     logger.info(f"   Tools: {'✅' if TOOLS_AVAILABLE else '❌'} | Chains: {'✅' if CHAINS_AVAILABLE else '❌'} | Knowledge: {'✅' if SMART_KNOWLEDGE else '❌'} | Mission Control: {'✅' if MISSION_CONTROL else '❌'}")
     logger.info(f"   Memory: {'✅' if SWARM_MEMORY else '❌'} | MCP: {'✅' if MCP_AVAILABLE else '❌'} | Workflows: {'✅' if WORKFLOWS_AVAILABLE else '❌'} | Rate Limit: {'✅' if rate_limiter else '❌'}")
-    logger.info(f"   Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
+    logger.info(f"   Multi-Model: {'✅ ' + str(len([p for p in model_router.get_available_providers() if p['available']])) + ' providers' if MULTI_MODEL and model_router else '❌ Anthropic-only'}")
+    channels_str = "/".join([c for c, e in [("TG", TELEGRAM_ENABLED), ("DC", DISCORD_ENABLED), ("SL", SLACK_ENABLED)] if e]) or "none"
+    logger.info(f"   Channels: {channels_str} | Marketplace: {'✅' if MARKETPLACE_AVAILABLE else '❌'} | Auth: {'Gumroad' if GUMROAD_PRODUCT_ID else 'Dev mode (any key)'} | DB: {db_type}")
     yield
     scheduler_task.cancel()
     try:
@@ -1479,6 +1626,10 @@ async def health():
         "swarm_memory": SWARM_MEMORY,
         "mcp_registry": MCP_AVAILABLE,
         "rate_limiting": rate_limiter is not None,
+        "multi_model": MULTI_MODEL,
+        "workflows": WORKFLOWS_AVAILABLE,
+        "channels": {"telegram": TELEGRAM_ENABLED, "discord": DISCORD_ENABLED, "slack": SLACK_ENABLED},
+        "marketplace": MARKETPLACE_AVAILABLE,
     }
 
 
@@ -1756,12 +1907,13 @@ async def deploy_agent(req: DeployRequest, api_key: str = Depends(get_api_key)):
     finally:
         conn.close()
 
-    asyncio.create_task(execute_task(agent_id, req.agent_type, req.task_description, api_key))
+    asyncio.create_task(execute_task(agent_id, req.agent_type, req.task_description, api_key, model=req.model))
 
     return {
         "agent_id": agent_id,
         "agent_type": req.agent_type,
         "agent_name": AGENTS[req.agent_type]["name"],
+        "model": req.model or CLAUDE_MODEL,
         "status": "running",
         "message": f"Agent deployed. Poll /api/v1/status/{agent_id} for results.",
     }
@@ -1988,6 +2140,46 @@ async def deploy_collab(req: CollabRequest, api_key: str = Depends(get_api_key))
     }
 
 
+# ─── MODEL ENDPOINTS ─────────────────────────────────────
+
+@app.get("/api/v1/models")
+async def list_models():
+    """List all available LLM providers and models."""
+    if not MULTI_MODEL or not model_router:
+        return {
+            "providers": [{
+                "provider": "anthropic",
+                "name": "Anthropic",
+                "available": bool(ANTHROPIC_API_KEY),
+                "models": [{"model_id": CLAUDE_MODEL, "name": "Claude Haiku 4.5"}],
+                "default_model": CLAUDE_MODEL,
+            }],
+            "default_model": CLAUDE_MODEL,
+        }
+    providers = model_router.get_available_providers()
+    return {
+        "providers": providers,
+        "available_count": sum(1 for p in providers if p["available"]),
+        "total_models": sum(len(p["models"]) for p in providers),
+    }
+
+
+@app.get("/api/v1/models/available")
+async def list_available_models():
+    """List only models that have API keys configured and are ready to use."""
+    if not MULTI_MODEL or not model_router:
+        return {"models": [{"model_id": CLAUDE_MODEL, "provider": "anthropic", "name": "Claude Haiku 4.5"}]}
+    providers = model_router.get_available_providers()
+    models = []
+    for p in providers:
+        if p["available"]:
+            for m in p["models"]:
+                m["provider"] = p["provider"]
+                m["provider_name"] = p["name"]
+                models.append(m)
+    return {"models": models, "count": len(models)}
+
+
 # ─── MCP TOOL ENDPOINTS ──────────────────────────────────
 
 class MCPToolRequest(BaseModel):
@@ -2083,6 +2275,225 @@ async def check_rate_limit(api_key: str = Depends(get_api_key)):
     if not rate_limiter:
         return {"message": "Rate limiting not active"}
     return rate_limiter.get_usage(api_key, "starter")
+
+
+# ─── MARKETPLACE ENDPOINTS ───────────────────────────────
+
+class CreateAgentRequest(BaseModel):
+    name: str
+    description: str
+    system_prompt: str
+    category: str = "general"
+    tags: list = []
+    tools: list = []
+    model_preference: str = ""
+    icon: str = "🤖"
+    price_usd: float = 0.0
+    creator_name: str = "anonymous"
+    long_description: str = ""
+
+
+class ReviewRequest(BaseModel):
+    rating: int
+    review_text: str = ""
+
+
+class SkillPackRequest(BaseModel):
+    name: str
+    description: str
+    agent_ids: list = []
+    workflow_configs: list = []
+    mcp_tool_configs: list = []
+    price_usd: float = 0.0
+    creator_name: str = "anonymous"
+
+
+@app.post("/api/v1/marketplace/agents")
+async def create_marketplace_agent(req: CreateAgentRequest, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    result = await marketplace.create_agent(
+        creator_key=api_key, name=req.name, description=req.description,
+        system_prompt=req.system_prompt, category=req.category, tags=req.tags,
+        tools=req.tools, model_preference=req.model_preference, icon=req.icon,
+        price_usd=req.price_usd, creator_name=req.creator_name,
+        long_description=req.long_description,
+    )
+    return result
+
+
+@app.get("/api/v1/marketplace/agents")
+async def browse_marketplace(category: str = None, search: str = None, sort: str = "popular", limit: int = 20, offset: int = 0):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        return {"agents": [], "starters": STARTER_AGENTS}
+    agents = await marketplace.browse(category=category, search=search, sort=sort, limit=limit, offset=offset)
+    return {"agents": agents}
+
+
+@app.get("/api/v1/marketplace/agents/{slug_or_id}")
+async def get_marketplace_agent(slug_or_id: str):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    agent = await marketplace.get_agent_detail(slug_or_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+@app.post("/api/v1/marketplace/agents/{agent_id}/publish")
+async def publish_agent(agent_id: str, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    return await marketplace.publish_agent(agent_id, api_key)
+
+
+@app.post("/api/v1/marketplace/agents/{agent_id}/unpublish")
+async def unpublish_agent(agent_id: str, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    return await marketplace.unpublish_agent(agent_id, api_key)
+
+
+@app.put("/api/v1/marketplace/agents/{agent_id}")
+async def update_marketplace_agent(agent_id: str, request: Request, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    updates = await request.json()
+    return await marketplace.update_agent(agent_id, api_key, updates)
+
+
+@app.post("/api/v1/marketplace/agents/{agent_id}/install")
+async def install_marketplace_agent(agent_id: str, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    result = await marketplace.install_agent(api_key, agent_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/v1/marketplace/agents/{agent_id}/uninstall")
+async def uninstall_marketplace_agent(agent_id: str, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    return await marketplace.uninstall_agent(api_key, agent_id)
+
+
+@app.get("/api/v1/marketplace/installed")
+async def list_installed(api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        return {"agents": []}
+    agents = await marketplace.get_installed(api_key)
+    return {"agents": agents}
+
+
+@app.post("/api/v1/marketplace/agents/{agent_id}/deploy")
+async def deploy_marketplace_agent(agent_id: str, request: Request, api_key: str = Depends(get_api_key)):
+    """Deploy an installed marketplace agent with a task."""
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    body = await request.json()
+    task = body.get("task_description", "")
+    model = body.get("model")
+    if not task:
+        raise HTTPException(status_code=400, detail="task_description required")
+
+    # Verify installed
+    installed = await marketplace.get_installed(api_key)
+    agent_match = next((a for a in installed if a["agent_id"] == agent_id), None)
+    if not agent_match:
+        raise HTTPException(status_code=403, detail="Agent not installed. Install it first.")
+
+    run_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        db_execute(conn,
+            f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+            (run_id, api_key, f"mp:{agent_match['slug']}", task, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    asyncio.create_task(execute_task(run_id, f"mp:{agent_match['slug']}", task, api_key, model=model))
+
+    return {
+        "agent_id": run_id,
+        "marketplace_agent": agent_match["name"],
+        "model": model or agent_match.get("model_preference") or "default",
+        "status": "running",
+    }
+
+
+@app.post("/api/v1/marketplace/agents/{agent_id}/review")
+async def review_agent(agent_id: str, req: ReviewRequest, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    result = await marketplace.add_review(agent_id, api_key, req.rating, req.review_text)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/api/v1/marketplace/agents/{agent_id}/reviews")
+async def get_agent_reviews(agent_id: str):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        return {"reviews": []}
+    return {"reviews": await marketplace.get_reviews(agent_id)}
+
+
+@app.get("/api/v1/marketplace/my-agents")
+async def my_marketplace_agents(api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        return {"agents": []}
+    return {"agents": await marketplace.get_my_agents(api_key)}
+
+
+@app.get("/api/v1/marketplace/earnings")
+async def my_earnings(api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        return {"total_earned": 0, "total_sales": 0, "recent_sales": []}
+    return await marketplace.get_earnings(api_key)
+
+
+@app.post("/api/v1/marketplace/skill-packs")
+async def create_skill_pack(req: SkillPackRequest, api_key: str = Depends(get_api_key)):
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        raise HTTPException(status_code=503, detail="Marketplace not loaded")
+    return await marketplace.create_skill_pack(
+        creator_key=api_key, name=req.name, description=req.description,
+        agent_ids=req.agent_ids, workflow_configs=req.workflow_configs,
+        mcp_tool_configs=req.mcp_tool_configs, price_usd=req.price_usd,
+        creator_name=req.creator_name,
+    )
+
+
+@app.get("/api/v1/marketplace/stats")
+async def marketplace_stats():
+    if not MARKETPLACE_AVAILABLE or not marketplace:
+        return {"published_agents": 0, "total_installs": 0, "active_creators": 0}
+    return await marketplace.get_marketplace_stats()
+
+
+@app.get("/api/v1/marketplace/categories")
+async def marketplace_categories():
+    return {"categories": [
+        {"id": "crypto-defi", "name": "Crypto & DeFi", "icon": "💎"},
+        {"id": "coding-dev", "name": "Coding & Dev", "icon": "💻"},
+        {"id": "writing-content", "name": "Writing & Content", "icon": "✍️"},
+        {"id": "data-research", "name": "Data & Research", "icon": "📊"},
+        {"id": "business-strategy", "name": "Business & Strategy", "icon": "📈"},
+        {"id": "productivity", "name": "Productivity", "icon": "⚡"},
+        {"id": "security", "name": "Security", "icon": "🔒"},
+        {"id": "marketing", "name": "Marketing", "icon": "📢"},
+    ]}
+
+
+@app.get("/api/v1/marketplace/featured")
+async def marketplace_featured():
+    """Get starter/featured agents."""
+    return {"starters": STARTER_AGENTS}
 
 
 # ─── WORKFLOW ENDPOINTS ──────────────────────────────────
@@ -2262,10 +2673,66 @@ async def telegram_webhook(request: Request):
     if not TELEGRAM_ENABLED:
         return {"ok": True}
     data = await request.json()
-    message = data.get("message")
-    if message:
-        asyncio.create_task(handle_telegram_message(message))
+    if CHANNELS_LOADED:
+        msg = parse_telegram_webhook(data)
+        if msg:
+            asyncio.create_task(command_router.handle(msg))
+    else:
+        message = data.get("message")
+        if message:
+            asyncio.create_task(handle_telegram_message(message))
     return {"ok": True}
+
+
+@app.post("/api/v1/discord/webhook")
+async def discord_webhook(request: Request):
+    """Discord Interactions endpoint — set this URL in Discord Developer Portal."""
+    if not DISCORD_ENABLED or not CHANNELS_LOADED:
+        return JSONResponse({"error": "Discord not configured"}, status_code=503)
+    data = await request.json()
+
+    # Discord verification ping
+    if data.get("type") == 1:
+        return JSONResponse({"type": 1})
+
+    msg = parse_discord_webhook(data)
+    if msg:
+        # For slash commands, acknowledge immediately then process
+        if data.get("type") == 2:
+            asyncio.create_task(command_router.handle(msg))
+            return JSONResponse({"type": 5})  # DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
+        asyncio.create_task(command_router.handle(msg))
+    return {"ok": True}
+
+
+@app.post("/api/v1/slack/webhook")
+async def slack_webhook(request: Request):
+    """Slack Events API endpoint — set this URL in Slack App settings."""
+    data = await request.json()
+
+    # Slack URL verification challenge
+    if data.get("type") == "url_verification":
+        return JSONResponse({"challenge": data.get("challenge", "")})
+
+    if not SLACK_ENABLED or not CHANNELS_LOADED:
+        return {"ok": True}
+
+    msg = parse_slack_webhook(data)
+    if msg:
+        asyncio.create_task(command_router.handle(msg))
+    return {"ok": True}
+
+
+@app.get("/api/v1/channels")
+async def list_channels():
+    """List all configured messaging channels."""
+    if CHANNELS_LOADED:
+        return get_channel_status()
+    return {
+        "telegram": {"enabled": TELEGRAM_ENABLED, "configured": bool(os.getenv("TELEGRAM_BOT_TOKEN", ""))},
+        "discord": {"enabled": False, "configured": False},
+        "slack": {"enabled": False, "configured": False},
+    }
 
 
 # ─── PREMIUM DASHBOARD ───────────────────────────────────
