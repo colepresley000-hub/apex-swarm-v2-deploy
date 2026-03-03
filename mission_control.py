@@ -165,12 +165,17 @@ class EventBus:
         self._telegram_chat_ids: set[int] = set()
         self._telegram_send_fn: Optional[Callable] = None
         self._telegram_verbosity: str = "important"  # "all", "important", "alerts_only"
+        self._post_emit_hooks: list[Callable] = []
         self._stats = {
             "total_events": 0,
             "events_by_type": {},
             "active_agents": {},
             "active_daemons": {},
         }
+
+    def add_post_emit_hook(self, hook: Callable):
+        """Add a callback that fires after every event emission."""
+        self._post_emit_hooks.append(hook)
 
     def set_telegram(self, send_fn: Callable, chat_ids: set[int] = None, verbosity: str = "important"):
         """Configure Telegram forwarding."""
@@ -246,6 +251,13 @@ class EventBus:
                         await self._telegram_send_fn(chat_id, msg)
                     except Exception as e:
                         logger.error(f"Telegram forward failed: {e}")
+
+        # Fire post-emit hooks (workflow engine, etc.)
+        for hook in self._post_emit_hooks:
+            try:
+                await hook(event)
+            except Exception as e:
+                logger.error(f"Post-emit hook failed: {e}")
 
     def _should_send_telegram(self, event: Event) -> bool:
         """Filter events based on verbosity level."""
@@ -548,4 +560,3 @@ DAEMON_PRESETS = {
         "alert_conditions": ["launch", "trending", "viral", "funding", "acquisition"],
     },
 }
-# force rebuild
