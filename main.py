@@ -172,6 +172,16 @@ except ImportError:
     VOICE_OPTIONS = {}
     logger.warning("⚠️ voice not found — no voice interface")
 
+# Agent-to-Agent Protocol
+A2A_AVAILABLE = False
+a2a_engine = None
+try:
+    from a2a_protocol import A2AEngine, discover_agent as a2a_discover
+    A2A_AVAILABLE = True
+    logger.info("✅ a2a_protocol loaded — agents can hire and delegate to other agents")
+except ImportError:
+    logger.warning("⚠️ a2a_protocol not found — no agent-to-agent delegation")
+
 # Smart knowledge (optional)
 SMART_KNOWLEDGE = False
 try:
@@ -679,6 +689,34 @@ def init_db():
             logger.error(f"Marketplace init failed: {e}")
         finally:
             conn.close()
+
+    # Initialize A2A engine
+    if A2A_AVAILABLE:
+        global a2a_engine
+
+        async def _a2a_llm_call(system_prompt: str, message: str, model: str = None) -> str:
+            """LLM call for decomposition and aggregation."""
+            if MULTI_MODEL and model_router:
+                result = await model_router.call(
+                    model_id=model or CLAUDE_MODEL,
+                    system_prompt=system_prompt,
+                    messages=[{"role": "user", "content": message}],
+                    max_tokens=4096,
+                )
+                return result.get("text", "")
+            else:
+                import httpx
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    resp = await client.post("https://api.anthropic.com/v1/messages",
+                        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                        json={"model": CLAUDE_MODEL, "max_tokens": 4096, "system": system_prompt, "messages": [{"role": "user", "content": message}]})
+                if resp.status_code == 200:
+                    return resp.json().get("content", [{}])[0].get("text", "")
+                return ""
+
+        a2a_engine = A2AEngine(AGENTS, execute_task, _a2a_llm_call)
+        a2a_engine.set_db(get_db, USER_KEY_COL)
+        logger.info("✅ A2A engine initialized — agent delegation active")
 
 
 # ─── COST TRACKING ────────────────────────────────────────
@@ -1630,6 +1668,7 @@ async def health():
         "agents": len(AGENTS),
         "tools": TOOLS_AVAILABLE,
         "chains": CHAINS_AVAILABLE,
+        "knowledge": SMART_KNOWLEDGE,
         "smart_knowledge": SMART_KNOWLEDGE,
         "mission_control": MISSION_CONTROL,
         "telegram": TELEGRAM_ENABLED,
@@ -1643,6 +1682,7 @@ async def health():
         "channels": {"telegram": TELEGRAM_ENABLED, "discord": DISCORD_ENABLED, "slack": SLACK_ENABLED},
         "marketplace": MARKETPLACE_AVAILABLE,
         "voice": VOICE_AVAILABLE,
+        "a2a_protocol": A2A_AVAILABLE,
     }
 
 
@@ -2308,6 +2348,59 @@ async def check_rate_limit(api_key: str = Depends(get_api_key)):
     if not rate_limiter:
         return {"message": "Rate limiting not active"}
     return rate_limiter.get_usage(api_key, "starter")
+
+
+# ─── A2A PROTOCOL ENDPOINTS ──────────────────────────────
+
+class A2ARequest(BaseModel):
+    task: str
+    lead_agent: str = "research"
+    model: Optional[str] = None
+    strategy: Optional[str] = None
+    max_subtasks: int = 5
+
+
+@app.post("/api/v1/a2a/delegate")
+async def a2a_delegate(req: A2ARequest, api_key: str = Depends(get_api_key)):
+    """Decompose a complex task and delegate to multiple agents."""
+    if not A2A_AVAILABLE or not a2a_engine:
+        raise HTTPException(status_code=503, detail="A2A protocol not loaded")
+    plan = await a2a_engine.decompose_and_delegate(
+        task=req.task, lead_agent=req.lead_agent,
+        user_api_key=api_key, model=req.model, max_subtasks=req.max_subtasks,
+    )
+    return plan.to_dict()
+
+
+@app.get("/api/v1/a2a/plans")
+async def list_a2a_plans():
+    if not A2A_AVAILABLE or not a2a_engine:
+        return {"plans": []}
+    return {"plans": a2a_engine.get_active_plans()}
+
+
+@app.get("/api/v1/a2a/plans/{plan_id}")
+async def get_a2a_plan(plan_id: str):
+    if not A2A_AVAILABLE or not a2a_engine:
+        raise HTTPException(status_code=503, detail="A2A not loaded")
+    plan = a2a_engine.get_plan(plan_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return plan
+
+
+@app.get("/api/v1/a2a/plans/{plan_id}/messages")
+async def get_a2a_messages(plan_id: str):
+    if not A2A_AVAILABLE or not a2a_engine:
+        return {"messages": []}
+    return {"messages": a2a_engine.get_plan_messages(plan_id)}
+
+
+@app.get("/api/v1/a2a/stats")
+async def a2a_stats():
+    if not A2A_AVAILABLE or not a2a_engine:
+        return {"total_plans": 0}
+    return a2a_engine.get_stats()
 
 
 # ─── VOICE ENDPOINTS ─────────────────────────────────────
@@ -3203,6 +3296,10 @@ a{color:var(--green);text-decoration:none}
       <div class="nav-item" data-page="daemons" onclick="navigate('daemons')">
         <span class="nav-icon">👁️</span> Daemons
       </div>
+      <div class="nav-item" data-page="a2a" onclick="navigate('a2a')">
+        <span class="nav-icon">🔗</span> Agent-to-Agent
+        <span class="nav-badge">NEW</span>
+      </div>
       <div class="nav-item" data-page="schedules" onclick="navigate('schedules')">
         <span class="nav-icon">🕐</span> Schedules
       </div>
@@ -3255,7 +3352,7 @@ function navigate(page) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === page));
   const main = document.getElementById('mainContent');
   main.innerHTML = '<div style="display:flex;justify-content:center;padding:40px"><div class="spinner"></div></div>';
-  const pages = {overview:renderOverview,deploy:renderDeploy,agents:renderAgents,feed:renderFeed,marketplace:renderMarketplace,'create-agent':renderCreateAgent,'my-store':renderMyStore,workflows:renderWorkflows,daemons:renderDaemons,models:renderModels,channels:renderChannels,settings:renderSettings,schedules:renderSchedules};
+  const pages = {overview:renderOverview,deploy:renderDeploy,agents:renderAgents,feed:renderFeed,marketplace:renderMarketplace,'create-agent':renderCreateAgent,'my-store':renderMyStore,workflows:renderWorkflows,daemons:renderDaemons,a2a:renderA2A,models:renderModels,channels:renderChannels,settings:renderSettings,schedules:renderSchedules};
   (pages[page] || renderOverview)();
 }
 
@@ -3280,7 +3377,7 @@ async function renderOverview() {
         <div class="card">
           <div class="card-header"><div class="card-title">System Status</div></div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-            ${Object.entries({Tools:h.tools,Chains:h.chains,Knowledge:h.knowledge,'Mission Control':h.mission_control,Memory:h.swarm_memory,MCP:h.mcp_registry,'Multi-Model':h.multi_model,Marketplace:h.marketplace,Voice:h.voice,Workflows:h.workflows}).map(([k,v])=>`<div style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><span>${v?'🟢':'🔴'}</span>${k}</div>`).join('')}
+            ${Object.entries({Tools:h.tools,Chains:h.chains,Knowledge:h.knowledge,'Mission Control':h.mission_control,Memory:h.swarm_memory,MCP:h.mcp_registry,'Multi-Model':h.multi_model,Marketplace:h.marketplace,Voice:h.voice,Workflows:h.workflows,'A2A Protocol':h.a2a_protocol}).map(([k,v])=>`<div style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 0"><span>${v?'🟢':'🔴'}</span>${k}</div>`).join('')}
           </div>
         </div>
         <div class="card">
@@ -3640,6 +3737,78 @@ async function renderDaemons() {
 
 async function startDaemon(id) { await api('/api/v1/daemons/start', {method:'POST', body:JSON.stringify({preset_id:id})}); renderDaemons(); }
 async function stopDaemon(id) { await api('/api/v1/daemons/'+id+'/stop', {method:'POST'}); renderDaemons(); }
+
+// ─── A2A PROTOCOL ────────────────────────────────
+async function renderA2A() {
+  const [stats, plans] = await Promise.all([api('/api/v1/a2a/stats'), api('/api/v1/a2a/plans')]);
+  const s = stats || {};
+  const planList = (plans.plans || []).slice().reverse();
+  document.getElementById('mainContent').innerHTML = `
+    <div class="fade-in">
+      <h2 style="font-size:24px;font-weight:700;margin-bottom:4px">🔗 Agent-to-Agent Protocol</h2>
+      <p style="color:var(--text2);margin-bottom:20px">Give a complex task — agents decompose, delegate, and synthesize automatically</p>
+      <div class="grid-3" style="margin-bottom:24px">
+        <div class="stat"><div class="stat-value">${s.total_plans||0}</div><div class="stat-label">Total Plans</div></div>
+        <div class="stat"><div class="stat-value">${s.total_subtasks||0}</div><div class="stat-label">Total Subtasks</div></div>
+        <div class="stat"><div class="stat-value">${s.running||0}</div><div class="stat-label">Running</div></div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title" style="margin-bottom:12px">Launch Multi-Agent Task</div>
+          <div class="deploy-form">
+            <div class="form-group"><label class="form-label">Complex Task</label><textarea class="form-textarea" id="a2aTask" placeholder="e.g. Research the top 5 AI startups in 2026, analyze their business models, and write a competitive landscape report with investment recommendations"></textarea></div>
+            <div class="form-group"><label class="form-label">Lead Agent</label><select class="form-select" id="a2aLead"><option value="research">Research (default)</option><option value="data-analyst">Data Analyst</option><option value="market-analyst">Market Analyst</option></select></div>
+            <button class="btn btn-primary btn-lg" onclick="launchA2A()" id="a2aBtn">🔗 Delegate to Swarm</button>
+            <div id="a2aResult" style="margin-top:12px"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title" style="margin-bottom:12px">How It Works</div>
+          <div style="color:var(--text2);font-size:13px;line-height:2">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">1️⃣ <strong>Decompose</strong> — AI breaks your task into subtasks</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">2️⃣ <strong>Discover</strong> — best agent selected for each subtask</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">3️⃣ <strong>Delegate</strong> — sub-agents execute in parallel</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">4️⃣ <strong>Aggregate</strong> — lead agent synthesizes everything</div>
+          </div>
+        </div>
+      </div>
+      ${planList.length ? `<h3 style="font-size:16px;margin:20px 0 12px">Recent Plans</h3>` + planList.map(p => `
+        <div class="card" style="margin-bottom:12px;cursor:pointer" onclick="showA2APlan('${p.plan_id}')">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div><strong>${p.original_task}</strong><br><span style="color:var(--text2);font-size:12px">${p.subtasks.length} subtasks · ${p.strategy} · ${p.status}</span></div>
+            <div style="font-size:12px;color:${p.status==='completed'?'var(--green)':p.status==='running'?'var(--orange)':'var(--red)'}">${p.status.toUpperCase()}</div>
+          </div>
+        </div>`).join('') : ''}
+    </div>`;
+}
+
+async function launchA2A() {
+  const btn = document.getElementById('a2aBtn');
+  btn.innerHTML = '<div class="spinner"></div> Delegating...';
+  btn.disabled = true;
+  const r = await api('/api/v1/a2a/delegate', {method:'POST', body:JSON.stringify({task:document.getElementById('a2aTask').value, lead_agent:document.getElementById('a2aLead').value})});
+  btn.innerHTML = '🔗 Delegate to Swarm';
+  btn.disabled = false;
+  const el = document.getElementById('a2aResult');
+  if (r.plan_id) {
+    const subtaskHtml = (r.subtasks||[]).map(s => `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)"><div class="agent-status ${s.status}"></div><strong>${s.agent_type}</strong><span style="color:var(--text2);font-size:12px;flex:1">${(s.description||'').slice(0,80)}</span><span style="font-size:11px;color:${s.status==='completed'?'var(--green)':'var(--red)'}">${s.status}</span></div>`).join('');
+    el.innerHTML = `<div class="card" style="margin-top:12px"><div class="card-title">Plan: ${r.plan_id}</div><div style="margin:8px 0;font-size:12px;color:var(--text2)">${r.subtasks.length} subtasks · ${r.strategy} · ${r.status}</div>${subtaskHtml}${r.final_result?`<div style="margin-top:12px;padding:12px;background:var(--surface2);border-radius:8px;font-size:13px;white-space:pre-wrap;max-height:300px;overflow-y:auto">${r.final_result.replace(/</g,'&lt;')}</div>`:''}</div>`;
+  } else {
+    el.innerHTML = `<div style="color:var(--red)">❌ ${r.detail||r.error||'Failed'}</div>`;
+  }
+}
+
+async function showA2APlan(planId) {
+  const [plan, msgs] = await Promise.all([api('/api/v1/a2a/plans/'+planId), api('/api/v1/a2a/plans/'+planId+'/messages')]);
+  if (!plan || plan.error) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const subtaskHtml = (plan.subtasks||[]).map(s => `<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border)"><div class="agent-status ${s.status}"></div><strong>${s.agent_type}</strong><span style="flex:1;color:var(--text2);font-size:12px">${(s.description||'').slice(0,100)}</span><span style="font-size:11px">${s.status}</span></div>`).join('');
+  const msgHtml = (msgs.messages||[]).map(m => `<div style="font-size:12px;padding:4px 0;color:var(--text2)"><strong>${m.from}</strong> → ${m.to}: ${m.type} ${JSON.stringify(m.payload).slice(0,80)}</div>`).join('');
+  overlay.innerHTML = `<div class="modal"><div class="modal-title">Plan: ${plan.plan_id}</div><div style="color:var(--text2);font-size:12px;margin-bottom:16px">${plan.strategy} · ${plan.status}</div><h4 style="margin-bottom:8px">Subtasks</h4>${subtaskHtml}${plan.final_result?`<h4 style="margin:16px 0 8px">Final Result</h4><div style="white-space:pre-wrap;font-size:13px;max-height:300px;overflow-y:auto;background:var(--surface2);padding:12px;border-radius:8px">${plan.final_result.replace(/</g,'&lt;')}</div>`:''}${msgHtml?`<h4 style="margin:16px 0 8px">Protocol Messages</h4>${msgHtml}`:''}<button class="btn btn-secondary" style="margin-top:16px" onclick="this.closest('.modal-overlay').remove()">Close</button></div>`;
+  document.body.appendChild(overlay);
+}
 
 // ─── MODELS ──────────────────────────────────────
 async function renderModels() {
