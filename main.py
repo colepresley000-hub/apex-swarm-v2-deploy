@@ -1300,12 +1300,14 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
         return result
 
     except Exception as e:
-        logger.error(f"Task execution failed ({agent_id}): {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Task execution failed ({agent_id}): {e}\n{tb}")
         conn = get_db()
         try:
             conn.execute(
                 "UPDATE agents SET status = 'failed', result = ?, completed_at = ? WHERE id = ?",
-                (f"Error: {str(e)}", datetime.now(timezone.utc).isoformat(), agent_id),
+                (f"Error: {str(e)}\n\nTraceback:\n{tb[:1000]}", datetime.now(timezone.utc).isoformat(), agent_id),
             )
             conn.commit()
         finally:
@@ -2610,6 +2612,45 @@ async def a2a_stats():
 
 
 # ─── ENTERPRISE ENDPOINTS ─────────────────────────────────
+
+@app.post("/api/v1/deploy/sync")
+async def deploy_agent_sync(req: DeployRequest, api_key: str = Depends(get_api_key)):
+    """Deploy agent and WAIT for result (synchronous). For testing/debugging."""
+    if req.agent_type not in AGENTS and not req.agent_type.startswith("mp:"):
+        raise HTTPException(status_code=400, detail=f"Unknown agent: {req.agent_type}")
+
+    agent_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        db_execute(conn,
+            f"INSERT INTO agents (id, {USER_KEY_COL}, agent_type, task_description, status, created_at) VALUES (?, ?, ?, ?, 'running', ?)",
+            (agent_id, api_key, req.agent_type, req.task_description, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        await execute_task(agent_id, req.agent_type, req.task_description, api_key, model=req.model)
+    except Exception as e:
+        import traceback
+        return {"agent_id": agent_id, "status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT status, result FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return {
+        "agent_id": agent_id,
+        "status": row[0] if row else "unknown",
+        "result": row[1] if row else None,
+    }
+
 
 @app.get("/api/v1/metrics")
 async def get_metrics(api_key: str = Depends(get_api_key)):
