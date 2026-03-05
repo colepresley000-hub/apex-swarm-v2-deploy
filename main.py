@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -193,6 +194,24 @@ except ImportError:
     ROLES = {}
     COMPETITOR_DAEMON_CONFIG = {}
     logger.warning("⚠️ autonomous_goals not found — no goal system")
+
+# Enterprise hardening
+ENTERPRISE = False
+try:
+    from enterprise import (
+        retry_with_backoff, RetryConfig, CircuitBreaker, circuit_breakers,
+        ConversationStore, sanitize_input, sanitize_output, AuditLog,
+        MetricsCollector, metrics_collector, LatencyTracker,
+        get_api_docs,
+    )
+    ENTERPRISE = True
+    logger.info("✅ enterprise loaded — reliability, security, observability, docs")
+except ImportError:
+    metrics_collector = None
+    logger.warning("⚠️ enterprise not found — no hardening")
+
+conversation_store = None
+audit_log = None
 
 # Smart knowledge (optional)
 SMART_KNOWLEDGE = False
@@ -702,38 +721,38 @@ def init_db():
         finally:
             conn.close()
 
+    # Shared LLM call function for A2A and Goals
+    async def _shared_llm_call(system_prompt: str, message: str, model: str = None) -> str:
+        """LLM call for decomposition and aggregation."""
+        if MULTI_MODEL and model_router:
+            result = await model_router.call(
+                model_id=model or CLAUDE_MODEL,
+                system_prompt=system_prompt,
+                messages=[{"role": "user", "content": message}],
+                max_tokens=4096,
+            )
+            return result.get("text", "")
+        else:
+            import httpx
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                resp = await client.post("https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": CLAUDE_MODEL, "max_tokens": 4096, "system": system_prompt, "messages": [{"role": "user", "content": message}]})
+            if resp.status_code == 200:
+                return resp.json().get("content", [{}])[0].get("text", "")
+            return ""
+
     # Initialize A2A engine
     if A2A_AVAILABLE:
         global a2a_engine
-
-        async def _a2a_llm_call(system_prompt: str, message: str, model: str = None) -> str:
-            """LLM call for decomposition and aggregation."""
-            if MULTI_MODEL and model_router:
-                result = await model_router.call(
-                    model_id=model or CLAUDE_MODEL,
-                    system_prompt=system_prompt,
-                    messages=[{"role": "user", "content": message}],
-                    max_tokens=4096,
-                )
-                return result.get("text", "")
-            else:
-                import httpx
-                async with httpx.AsyncClient(timeout=45.0) as client:
-                    resp = await client.post("https://api.anthropic.com/v1/messages",
-                        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                        json={"model": CLAUDE_MODEL, "max_tokens": 4096, "system": system_prompt, "messages": [{"role": "user", "content": message}]})
-                if resp.status_code == 200:
-                    return resp.json().get("content", [{}])[0].get("text", "")
-                return ""
-
-        a2a_engine = A2AEngine(AGENTS, execute_task, _a2a_llm_call)
+        a2a_engine = A2AEngine(AGENTS, execute_task, _shared_llm_call)
         a2a_engine.set_db(get_db, USER_KEY_COL)
         logger.info("✅ A2A engine initialized — agent delegation active")
 
     # Initialize Goal Engine
     if GOALS_AVAILABLE:
         global goal_engine
-        goal_engine = GoalEngine(AGENTS, execute_task, _a2a_llm_call if A2A_AVAILABLE else None)
+        goal_engine = GoalEngine(AGENTS, execute_task, _shared_llm_call)
         goal_engine.set_db(get_db, USER_KEY_COL)
         logger.info("✅ Goal engine initialized — autonomous goals active")
 
@@ -741,6 +760,21 @@ def init_db():
     if GOALS_AVAILABLE and MISSION_CONTROL and COMPETITOR_DAEMON_CONFIG:
         DAEMON_PRESETS["competitor-intel"] = COMPETITOR_DAEMON_CONFIG
         logger.info("✅ Competitor tracking daemon preset added")
+
+    # Initialize enterprise components
+    if ENTERPRISE:
+        global conversation_store, audit_log
+        conversation_store = ConversationStore(get_db, db_execute, db_fetchall, USER_KEY_COL)
+        audit_log = AuditLog(get_db, db_execute, db_fetchall)
+        conn = get_db()
+        try:
+            conversation_store.init_tables(conn)
+            audit_log.init_tables(conn)
+            logger.info("✅ Enterprise tables initialized (conversations, audit_log)")
+        except Exception as e:
+            logger.error(f"Enterprise init failed: {e}")
+        finally:
+            conn.close()
 
 
 # ─── COST TRACKING ────────────────────────────────────────
@@ -1033,7 +1067,42 @@ def get_knowledge_for_agent(user_api_key: str, agent_type: str, task: str = "") 
 # ─── CORE EXECUTION ──────────────────────────────────────
 
 async def execute_task(agent_id: str, agent_type: str, task_description: str, user_api_key: str = "system", model: str = None, image_data: str = None, image_media_type: str = "image/jpeg"):
-    """Execute a single agent task. Supports built-in + marketplace agents."""
+    """Execute a single agent task. Enterprise-hardened with retries, sanitization, metrics."""
+    start_time = time.time() if ENTERPRISE else 0
+
+    # ── SECURITY: Input sanitization ──
+    if ENTERPRISE:
+        scan = sanitize_input(task_description)
+        if scan["blocked"]:
+            logger.warning(f"🛡️ Blocked input from {user_api_key[:8]}: {scan['flags']}")
+            if audit_log:
+                audit_log.log("input.blocked", user_api_key, agent_type,
+                              {"flags": scan["flags"], "agent_id": agent_id}, risk_score=scan["risk_score"])
+            conn = get_db()
+            try:
+                conn.execute("UPDATE agents SET status = 'failed', result = ?, completed_at = ? WHERE id = ?",
+                    ("Request blocked by security filter.", datetime.now(timezone.utc).isoformat(), agent_id))
+                conn.commit()
+            finally:
+                conn.close()
+            return
+        if scan["flags"] and audit_log:
+            audit_log.log("input.flagged", user_api_key, agent_type,
+                          {"flags": scan["flags"], "agent_id": agent_id}, risk_score=scan["risk_score"])
+
+    # ── METRICS: Track deployment ──
+    if ENTERPRISE and metrics_collector:
+        metrics_collector.record("agent.deployed", 1, {"type": agent_type})
+
+    # ── PERSISTENCE: Inject conversation context ──
+    if ENTERPRISE and conversation_store:
+        try:
+            context = conversation_store.get_context(user_api_key, agent_type)
+            if context:
+                task_description = task_description + "\n\n" + context
+        except Exception:
+            pass
+
     marketplace_agent = None
 
     # Check if it's a marketplace agent (format: mp:slug or mp:agent_id)
@@ -1162,6 +1231,10 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
             result = data["content"][0]["text"]
 
         # Save result
+        # ── SECURITY: Sanitize output ──
+        if ENTERPRISE and result:
+            result = sanitize_output(result)
+
         conn = get_db()
         try:
             conn.execute(
@@ -1171,6 +1244,24 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
             conn.commit()
         finally:
             conn.close()
+
+        # ── PERSISTENCE: Save conversation turn ──
+        if ENTERPRISE and conversation_store and result:
+            try:
+                conversation_store.save_turn(user_api_key, agent_type, task_description[:500], result)
+            except Exception:
+                pass
+
+        # ── METRICS: Record success + latency ──
+        if ENTERPRISE and metrics_collector:
+            duration = time.time() - start_time
+            metrics_collector.record("agent.completed", 1, {"type": agent_type})
+            metrics_collector.histogram("agent.latency", duration, {"type": agent_type})
+
+        # ── AUDIT: Log completion ──
+        if ENTERPRISE and audit_log:
+            audit_log.log("agent.completed", user_api_key, agent_type,
+                          {"agent_id": agent_id, "result_length": len(result) if result else 0})
 
         # Emit completed event
         if MISSION_CONTROL:
@@ -1708,6 +1799,7 @@ async def health():
         "voice": VOICE_AVAILABLE,
         "a2a_protocol": A2A_AVAILABLE,
         "autonomous_goals": GOALS_AVAILABLE,
+        "enterprise": ENTERPRISE,
     }
 
 
@@ -2515,6 +2607,54 @@ async def a2a_stats():
     if not A2A_AVAILABLE or not a2a_engine:
         return {"total_plans": 0}
     return a2a_engine.get_stats()
+
+
+# ─── ENTERPRISE ENDPOINTS ─────────────────────────────────
+
+@app.get("/api/v1/metrics")
+async def get_metrics(api_key: str = Depends(get_api_key)):
+    if not ENTERPRISE or not metrics_collector:
+        return {"error": "Metrics not available"}
+    return metrics_collector.get_summary()
+
+
+@app.get("/api/v1/metrics/agents")
+async def get_agent_metrics(api_key: str = Depends(get_api_key)):
+    if not ENTERPRISE or not metrics_collector:
+        return {"counts": {}, "latencies": {}}
+    return metrics_collector.get_agent_metrics()
+
+
+@app.get("/api/v1/audit")
+async def get_audit_log(limit: int = 50, flagged_only: bool = False, api_key: str = Depends(get_api_key)):
+    if not ENTERPRISE or not audit_log:
+        return {"events": []}
+    return {"events": audit_log.get_recent(limit, flagged_only)}
+
+
+@app.get("/api/v1/circuit-breakers")
+async def get_circuit_breakers(api_key: str = Depends(get_api_key)):
+    if not ENTERPRISE:
+        return {"breakers": []}
+    return {"breakers": [cb.get_status() for cb in circuit_breakers.values()]}
+
+
+@app.get("/api/v1/docs/openapi.json")
+async def openapi_spec():
+    if not ENTERPRISE:
+        return {"info": {"title": "APEX SWARM", "version": VERSION}}
+    return get_api_docs()
+
+
+@app.get("/api/v1/docs", response_class=HTMLResponse)
+async def api_docs_page():
+    """Interactive API documentation powered by Swagger UI."""
+    return HTMLResponse(f"""<!DOCTYPE html><html><head><title>APEX SWARM API Docs</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.11.0/swagger-ui.min.css">
+</head><body><div id="swagger-ui"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.11.0/swagger-ui-bundle.min.js"></script>
+<script>SwaggerUIBundle({{url:'/api/v1/docs/openapi.json',dom_id:'#swagger-ui',deepLinking:true}})</script>
+</body></html>""")
 
 
 # ─── VOICE ENDPOINTS ─────────────────────────────────────
