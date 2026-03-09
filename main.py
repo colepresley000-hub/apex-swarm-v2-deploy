@@ -2030,6 +2030,57 @@ async def start_daemon(req: DaemonRequest, api_key: str = Depends(get_api_key)):
         raise HTTPException(status_code=400, detail="Provide preset_id or task_description")
 
 
+
+@app.get("/api/v1/daemons/status")
+async def get_daemon_status(api_key: str = Depends(verify_api_key)):
+    """
+    Returns live status of all daemons.
+    Shows: id, preset_id, status, last_run, next_run, run_count, last_error
+    """
+    try:
+        daemons = daemon_manager.daemons if hasattr(daemon_manager, "daemons") else {}
+        now = datetime.utcnow()
+
+        result = []
+        for daemon_id, d in daemons.items():
+            interval = d.get("interval_seconds", 0)
+            last_run = d.get("last_run")
+            next_run = None
+            if last_run and interval:
+                try:
+                    lr = datetime.fromisoformat(last_run) if isinstance(last_run, str) else last_run
+                    next_run = (lr + timedelta(seconds=interval)).isoformat()
+                except Exception:
+                    pass
+
+            result.append({
+                "daemon_id": daemon_id,
+                "preset_id": d.get("preset_id", "custom"),
+                "agent_type": d.get("agent_type"),
+                "status": d.get("status", "unknown"),
+                "interval_seconds": interval,
+                "run_count": d.get("run_count", 0),
+                "last_run": last_run,
+                "next_run_estimated": next_run,
+                "last_error": d.get("last_error"),
+            })
+
+        # Flag any boot daemons that are missing entirely
+        running_presets = {r["preset_id"] for r in result}
+        missing = [p for p in BOOT_DAEMONS if p not in running_presets]
+
+        return {
+            "total_daemons": len(result),
+            "running": sum(1 for r in result if r["status"] == "running"),
+            "stopped": sum(1 for r in result if r["status"] != "running"),
+            "missing_boot_daemons": missing,
+            "daemons": result,
+            "checked_at": now.isoformat(),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Status check failed: {str(e)}")
+
+
 @app.get("/api/v1/daemons")
 async def list_daemons():
     if not MISSION_CONTROL:
@@ -4800,3 +4851,56 @@ go('overview');
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
+
+
+# ── DAEMON AUTO-START ────────────────────────────────────────────────────────
+BOOT_DAEMONS = [
+    "crypto-monitor",
+    "defi-yield-scanner",
+    "news-sentinel",
+    "whale-watcher",
+    "competitor-tracker",
+    "competitor-intel",
+]
+
+async def autostart_daemons():
+    """Auto-start all preset daemons on boot. Idempotent — skips running ones."""
+    print("[BOOT] Starting daemon auto-start sequence...", flush=True)
+    started = 0
+    skipped = 0
+    failed = 0
+    for preset_id in BOOT_DAEMONS:
+        try:
+            # Check if already running
+            already_running = any(
+                d.get("preset_id") == preset_id and d.get("status") == "running"
+                for d in daemon_manager.daemons.values()
+            ) if hasattr(daemon_manager, "daemons") else False
+
+            if already_running:
+                print(f"[BOOT] Daemon '{preset_id}' already running — skipped", flush=True)
+                skipped += 1
+                continue
+
+            # Find preset config
+            preset = next((p for p in DAEMON_PRESETS if p["id"] == preset_id), None)
+            if not preset:
+                print(f"[BOOT] WARNING: No preset found for '{preset_id}'", flush=True)
+                failed += 1
+                continue
+
+            # Start the daemon
+            daemon_id = await daemon_manager.start_daemon(
+                agent_type=preset["agent_type"],
+                task_description=preset["task"],
+                interval_seconds=preset["interval_seconds"],
+                preset_id=preset_id,
+            )
+            print(f"[BOOT] ✅ Started '{preset_id}' → daemon_id={daemon_id} (every {preset['interval_seconds']}s)", flush=True)
+            started += 1
+
+        except Exception as e:
+            print(f"[BOOT] ❌ Failed to start '{preset_id}': {e}", flush=True)
+            failed += 1
+
+    print(f"[BOOT] Daemon auto-start complete: {started} started, {skipped} skipped, {failed} failed", flush=True)
