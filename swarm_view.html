@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APEX SWARM — Live Swarm View</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#050508;--surface:#0e0e18;--surface2:#141422;
+  --border:rgba(255,255,255,0.06);
+  --text:#f0f0f8;--text2:#8888a8;--text3:#555570;
+  --mint:#00f0a0;--mintglow:rgba(0,240,160,0.25);
+  --cyan:#00d4ff;--cyanglow:rgba(0,212,255,0.2);
+  --amber:#ffb800;--amberglow:rgba(255,184,0,0.2);
+  --rose:#ff3366;--roseglow:rgba(255,51,102,0.2);
+  --violet:#7733ff;--violetglow:rgba(119,51,255,0.2);
+}
+body{background:var(--bg);color:var(--text);font-family:'Instrument Sans',sans-serif;overflow:hidden;height:100vh}
+
+/* ─── LAYOUT ─── */
+.container{display:grid;grid-template-columns:1fr 340px;grid-template-rows:56px 1fr;height:100vh}
+.topbar{grid-column:1/-1;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px}
+.canvas-area{position:relative;overflow:hidden}
+.sidebar{background:var(--surface);border-left:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+
+/* ─── TOPBAR ─── */
+.top-title{font-weight:700;font-size:15px;display:flex;align-items:center;gap:10px}
+.top-title .pulse{width:8px;height:8px;border-radius:50%;background:var(--mint);box-shadow:0 0 12px var(--mintglow);animation:breathe 2s ease infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:0.4}}
+.top-stats{display:flex;gap:24px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--text2)}
+.top-stats span{color:var(--mint);font-weight:600}
+.top-back{color:var(--text2);font-size:13px;cursor:pointer;text-decoration:none;display:flex;align-items:center;gap:6px}
+.top-back:hover{color:var(--mint)}
+
+/* ─── CANVAS ─── */
+.canvas-area canvas{display:block}
+.canvas-overlay{position:absolute;bottom:20px;left:20px;display:flex;gap:12px}
+.legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text3)}
+.legend-dot{width:8px;height:8px;border-radius:50%}
+
+/* ─── SIDEBAR TABS ─── */
+.side-tabs{display:flex;border-bottom:1px solid var(--border)}
+.side-tab{flex:1;padding:12px;text-align:center;font-size:12px;font-weight:500;color:var(--text3);cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s}
+.side-tab:hover{color:var(--text)}
+.side-tab.active{color:var(--mint);border-bottom-color:var(--mint)}
+.side-content{flex:1;overflow-y:auto;padding:12px}
+
+/* ─── AGENT ITEMS ─── */
+.agent-item{padding:10px 12px;border-radius:10px;margin-bottom:6px;cursor:pointer;transition:all 0.2s;border:1px solid transparent}
+.agent-item:hover{background:rgba(255,255,255,0.02);border-color:var(--border)}
+.agent-item.selected{background:var(--surface2);border-color:var(--border)}
+.agent-item-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.agent-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.agent-item-name{font-weight:600;font-size:13px;flex:1}
+.agent-item-badge{font-family:'IBM Plex Mono',monospace;font-size:9px;padding:2px 6px;border-radius:4px;font-weight:600;text-transform:uppercase}
+.agent-item-task{font-size:11.5px;color:var(--text2);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+
+/* ─── EVENT LOG ─── */
+.event-log-item{padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;display:flex;gap:8px}
+.event-log-item:last-child{border:none}
+.event-log-time{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text3);white-space:nowrap;min-width:55px}
+.event-log-msg{color:var(--text2);line-height:1.4}
+.event-log-msg strong{color:var(--text);font-weight:500}
+
+/* ─── DETAIL PANEL ─── */
+.detail-panel{padding:16px;border-top:1px solid var(--border);background:var(--surface2)}
+.detail-title{font-weight:700;font-size:14px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.detail-field{font-size:12px;color:var(--text2);margin-bottom:4px}
+.detail-field span{color:var(--text)}
+.detail-result{margin-top:8px;padding:10px;background:var(--bg);border-radius:8px;font-size:12px;max-height:150px;overflow-y:auto;white-space:pre-wrap;line-height:1.5;color:var(--text2)}
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- TOP BAR -->
+  <div class="topbar">
+    <a href="/dashboard" class="top-back">← Command Center</a>
+    <div class="top-title"><div class="pulse"></div> Live Swarm View</div>
+    <div class="top-stats">
+      <div>Active: <span id="statActive">0</span></div>
+      <div>Events: <span id="statEvents">0</span></div>
+      <div>Daemons: <span id="statDaemons">0</span></div>
+    </div>
+  </div>
+
+  <!-- CANVAS -->
+  <div class="canvas-area">
+    <canvas id="swarmCanvas"></canvas>
+    <div class="canvas-overlay">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--mint)"></div> Running</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--cyan)"></div> Completed</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--rose)"></div> Failed</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--amber)"></div> Daemon</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--violet)"></div> Delegating</div>
+    </div>
+  </div>
+
+  <!-- SIDEBAR -->
+  <div class="sidebar">
+    <div class="side-tabs">
+      <div class="side-tab active" onclick="switchTab('agents')">Agents</div>
+      <div class="side-tab" onclick="switchTab('events')">Events</div>
+      <div class="side-tab" onclick="switchTab('daemons')">Daemons</div>
+    </div>
+    <div class="side-content" id="sideContent"></div>
+    <div class="detail-panel" id="detailPanel" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+const BASE = location.origin;
+const KEY = localStorage.getItem('apex_key') || '';
+let nodes = [];
+let connections = [];
+let events = [];
+let selectedNode = null;
+let sseEvents = [];
+let currentTab = 'agents';
+let canvas, ctx, W, H;
+let animFrame;
+let mouseX = 0, mouseY = 0;
+
+// ─── API ─────────────────────────
+async function api(p) {
+  try {
+    const r = await fetch(BASE + p, { headers: { 'X-Api-Key': KEY } });
+    return await r.json();
+  } catch(e) { return {}; }
+}
+
+// ─── CANVAS SETUP ────────────────
+function initCanvas() {
+  canvas = document.getElementById('swarmCanvas');
+  ctx = canvas.getContext('2d');
+  resize();
+  window.addEventListener('resize', resize);
+  canvas.addEventListener('mousemove', e => { mouseX = e.offsetX; mouseY = e.offsetY; });
+  canvas.addEventListener('click', handleClick);
+}
+
+function resize() {
+  const area = canvas.parentElement;
+  W = area.clientWidth;
+  H = area.clientHeight;
+  canvas.width = W * devicePixelRatio;
+  canvas.height = H * devicePixelRatio;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+  // Reposition nodes
+  nodes.forEach(n => {
+    if (n.x > W) n.x = Math.random() * W * 0.8 + W * 0.1;
+    if (n.y > H) n.y = Math.random() * H * 0.8 + H * 0.1;
+  });
+}
+
+// ─── NODE MANAGEMENT ─────────────
+const COLORS = {
+  running: { fill: '#00f0a0', glow: 'rgba(0,240,160,0.3)', ring: 'rgba(0,240,160,0.15)' },
+  completed: { fill: '#00d4ff', glow: 'rgba(0,212,255,0.2)', ring: 'rgba(0,212,255,0.1)' },
+  failed: { fill: '#ff3366', glow: 'rgba(255,51,102,0.2)', ring: 'rgba(255,51,102,0.1)' },
+  daemon: { fill: '#ffb800', glow: 'rgba(255,184,0,0.2)', ring: 'rgba(255,184,0,0.1)' },
+  delegating: { fill: '#7733ff', glow: 'rgba(119,51,255,0.3)', ring: 'rgba(119,51,255,0.15)' },
+};
+
+const ICONS = {
+  'research': '🔬', 'crypto-research': '💎', 'market-analyst': '📊', 'blog-writer': '✍️',
+  'social-media': '📣', 'code-reviewer': '💻', 'data-analyst': '📈', 'seo-specialist': '🎯',
+  'copywriter': '✏️', 'defi-analyst': '🏦', 'macro-analyst': '🌐', 'pitch-deck': '📋',
+  'summarizer': '📝', 'api-designer': '🔧', 'legal-analyst': '⚖️',
+};
+
+function addNode(agent) {
+  // Check if already exists
+  const existing = nodes.find(n => n.id === agent.id);
+  if (existing) {
+    existing.status = agent.status;
+    existing.result = agent.result;
+    return existing;
+  }
+
+  const padding = 80;
+  const n = {
+    id: agent.id,
+    type: agent.agent_type || agent.type || 'research',
+    name: agent.agent_type || agent.type || 'agent',
+    task: agent.task_description || agent.task || '',
+    status: agent.status || 'running',
+    result: agent.result || '',
+    x: padding + Math.random() * (W - padding * 2),
+    y: padding + Math.random() * (H - padding * 2),
+    vx: (Math.random() - 0.5) * 0.3,
+    vy: (Math.random() - 0.5) * 0.3,
+    radius: agent.status === 'daemon' ? 22 : 16,
+    pulsePhase: Math.random() * Math.PI * 2,
+    born: Date.now(),
+  };
+  nodes.push(n);
+
+  // Keep max 50 nodes
+  if (nodes.length > 50) nodes.shift();
+
+  return n;
+}
+
+function addConnection(fromId, toId, type = 'delegate') {
+  connections.push({ from: fromId, to: toId, type, born: Date.now(), alpha: 1 });
+}
+
+// ─── RENDER LOOP ─────────────────
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  const t = Date.now() / 1000;
+
+  // Draw grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.015)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < W; x += 60) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y < H; y += 60) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  // Draw connections
+  connections.forEach((c, i) => {
+    const from = nodes.find(n => n.id === c.from);
+    const to = nodes.find(n => n.id === c.to);
+    if (!from || !to) return;
+
+    const age = (Date.now() - c.born) / 1000;
+    c.alpha = Math.max(0, 1 - age / 8); // Fade over 8s
+
+    if (c.alpha <= 0) { connections.splice(i, 1); return; }
+
+    // Animated dashed line
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const dashOffset = (t * 40) % 20;
+
+    ctx.strokeStyle = `rgba(119,51,255,${c.alpha * 0.4})`;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 8]);
+    ctx.lineDashOffset = -dashOffset;
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.lineTo(to.x, to.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Arrow head
+    const angle = Math.atan2(dy, dx);
+    const arrowX = to.x - Math.cos(angle) * (to.radius + 8);
+    const arrowY = to.y - Math.sin(angle) * (to.radius + 8);
+    ctx.fillStyle = `rgba(119,51,255,${c.alpha * 0.6})`;
+    ctx.beginPath();
+    ctx.moveTo(arrowX, arrowY);
+    ctx.lineTo(arrowX - Math.cos(angle - 0.4) * 8, arrowY - Math.sin(angle - 0.4) * 8);
+    ctx.lineTo(arrowX - Math.cos(angle + 0.4) * 8, arrowY - Math.sin(angle + 0.4) * 8);
+    ctx.fill();
+
+    // "Delegating" label
+    if (c.alpha > 0.5) {
+      ctx.fillStyle = `rgba(119,51,255,${c.alpha * 0.5})`;
+      ctx.font = '9px "IBM Plex Mono", monospace';
+      ctx.fillText('delegate', (from.x + to.x) / 2 - 20, (from.y + to.y) / 2 - 6);
+    }
+  });
+
+  // Update and draw nodes
+  nodes.forEach(n => {
+    // Drift
+    n.x += n.vx;
+    n.y += n.vy;
+
+    // Boundaries
+    if (n.x < 40 || n.x > W - 40) n.vx *= -1;
+    if (n.y < 40 || n.y > H - 40) n.vy *= -1;
+
+    // Gentle attraction to center
+    n.vx += (W / 2 - n.x) * 0.00003;
+    n.vy += (H / 2 - n.y) * 0.00003;
+
+    // Repel from other nodes
+    nodes.forEach(o => {
+      if (o.id === n.id) return;
+      const dx = n.x - o.x;
+      const dy = n.y - o.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 80) {
+        const force = (80 - dist) / 80 * 0.05;
+        n.vx += (dx / dist) * force;
+        n.vy += (dy / dist) * force;
+      }
+    });
+
+    // Damping
+    n.vx *= 0.995;
+    n.vy *= 0.995;
+
+    const colors = COLORS[n.status] || COLORS.running;
+    const pulse = Math.sin(t * 2 + n.pulsePhase) * 0.5 + 0.5;
+    const isHovered = Math.abs(mouseX - n.x) < 30 && Math.abs(mouseY - n.y) < 30;
+    const isSelected = selectedNode && selectedNode.id === n.id;
+
+    // Outer ring (pulse for running)
+    if (n.status === 'running' || n.status === 'daemon') {
+      const ringR = n.radius + 8 + pulse * 6;
+      ctx.fillStyle = colors.ring;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, ringR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Selection ring
+    if (isSelected) {
+      ctx.strokeStyle = colors.fill;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, n.radius + 14, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Glow
+    const grad = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, n.radius * 2.5);
+    grad.addColorStop(0, colors.glow);
+    grad.addColorStop(1, 'transparent');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.radius * 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Node body
+    ctx.fillStyle = isHovered ? colors.fill : `${colors.fill}cc`;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, isHovered ? n.radius + 2 : n.radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Inner dark circle
+    ctx.fillStyle = 'rgba(5,5,8,0.6)';
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, n.radius * 0.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Icon
+    const icon = ICONS[n.name] || '◈';
+    ctx.font = `${n.radius * 0.7}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(icon, n.x, n.y);
+
+    // Label
+    ctx.font = '10px "IBM Plex Mono", monospace';
+    ctx.fillStyle = isHovered ? colors.fill : 'rgba(255,255,255,0.4)';
+    ctx.textAlign = 'center';
+    ctx.fillText(n.name, n.x, n.y + n.radius + 14);
+
+    // Status label for hovered
+    if (isHovered) {
+      ctx.font = '9px "IBM Plex Mono", monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.fillText(n.status, n.x, n.y + n.radius + 26);
+
+      // Task preview
+      if (n.task) {
+        ctx.font = '10px "Instrument Sans", sans-serif';
+        ctx.fillStyle = 'rgba(255,255,255,0.25)';
+        const taskPreview = n.task.length > 40 ? n.task.slice(0, 40) + '...' : n.task;
+        ctx.fillText(taskPreview, n.x, n.y + n.radius + 38);
+      }
+    }
+  });
+
+  // Center label when empty
+  if (nodes.length === 0) {
+    ctx.font = '14px "Instrument Sans", sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.textAlign = 'center';
+    ctx.fillText('Deploy agents to see them here', W / 2, H / 2);
+    ctx.font = '11px "IBM Plex Mono", monospace';
+    ctx.fillText('Listening for activity...', W / 2, H / 2 + 24);
+  }
+
+  animFrame = requestAnimationFrame(render);
+}
+
+function handleClick(e) {
+  const x = e.offsetX, y = e.offsetY;
+  const clicked = nodes.find(n => Math.sqrt((n.x - x) ** 2 + (n.y - y) ** 2) < n.radius + 8);
+  selectedNode = clicked || null;
+  updateDetail();
+  renderSidebar();
+}
+
+// ─── SIDEBAR ─────────────────────
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.side-tab').forEach(t => t.classList.toggle('active', t.textContent.toLowerCase() === tab));
+  renderSidebar();
+}
+
+function renderSidebar() {
+  const el = document.getElementById('sideContent');
+  if (currentTab === 'agents') {
+    if (nodes.length === 0) {
+      el.innerHTML = '<div style="text-align:center;padding:40px 0;color:var(--text3);font-size:13px">No agents active<br><span style="font-size:11px">Deploy from the Command Center</span></div>';
+      return;
+    }
+    el.innerHTML = nodes.slice().reverse().map(n => {
+      const colors = { running: 'var(--mint)', completed: 'var(--cyan)', failed: 'var(--rose)', daemon: 'var(--amber)' };
+      const bgColors = { running: 'rgba(0,240,160,0.1)', completed: 'rgba(0,212,255,0.1)', failed: 'rgba(255,51,102,0.1)', daemon: 'rgba(255,184,0,0.1)' };
+      const isSelected = selectedNode && selectedNode.id === n.id;
+      return `<div class="agent-item${isSelected ? ' selected' : ''}" onclick="selectNode('${n.id}')">
+        <div class="agent-item-header">
+          <div class="agent-dot" style="background:${colors[n.status] || colors.running}"></div>
+          <div class="agent-item-name">${ICONS[n.name] || '◈'} ${n.name}</div>
+          <div class="agent-item-badge" style="background:${bgColors[n.status] || bgColors.running};color:${colors[n.status] || colors.running}">${n.status}</div>
+        </div>
+        <div class="agent-item-task">${n.task || 'No task description'}</div>
+      </div>`;
+    }).join('');
+  } else if (currentTab === 'events') {
+    if (sseEvents.length === 0) {
+      el.innerHTML = '<div style="text-align:center;padding:40px 0;color:var(--text3);font-size:13px">Waiting for events...</div>';
+      return;
+    }
+    el.innerHTML = sseEvents.slice().reverse().slice(0, 50).map(e => `<div class="event-log-item">
+      <div class="event-log-time">${new Date(e.timestamp).toLocaleTimeString()}</div>
+      <div class="event-log-msg"><strong>${e.agent_name || e.agent_type || 'system'}</strong> ${e.message || e.event_type || ''}</div>
+    </div>`).join('');
+  } else if (currentTab === 'daemons') {
+    const daemonNodes = nodes.filter(n => n.status === 'daemon');
+    if (daemonNodes.length === 0) {
+      el.innerHTML = '<div style="text-align:center;padding:40px 0;color:var(--text3);font-size:13px">No daemons running<br><span style="font-size:11px">Start from Command Center → Daemons</span></div>';
+      return;
+    }
+    el.innerHTML = daemonNodes.map(n => `<div class="agent-item" onclick="selectNode('${n.id}')">
+      <div class="agent-item-header">
+        <div class="agent-dot" style="background:var(--amber);box-shadow:0 0 8px var(--amberglow);animation:breathe 2s ease infinite"></div>
+        <div class="agent-item-name">${n.name}</div>
+        <div class="agent-item-badge" style="background:rgba(255,184,0,0.1);color:var(--amber)">LIVE</div>
+      </div>
+      <div class="agent-item-task">${n.task || 'Monitoring...'}</div>
+    </div>`).join('');
+  }
+}
+
+function selectNode(id) {
+  selectedNode = nodes.find(n => n.id === id) || null;
+  updateDetail();
+  renderSidebar();
+}
+
+function updateDetail() {
+  const panel = document.getElementById('detailPanel');
+  if (!selectedNode) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  const n = selectedNode;
+  const colors = { running: 'var(--mint)', completed: 'var(--cyan)', failed: 'var(--rose)', daemon: 'var(--amber)' };
+  panel.innerHTML = `
+    <div class="detail-title"><div class="agent-dot" style="background:${colors[n.status]||colors.running}"></div>${ICONS[n.name]||'◈'} ${n.name}</div>
+    <div class="detail-field">Status: <span style="color:${colors[n.status]||colors.running}">${n.status}</span></div>
+    <div class="detail-field">ID: <span>${n.id.slice(0, 12)}</span></div>
+    ${n.task ? `<div class="detail-field">Task: <span>${n.task.slice(0, 120)}</span></div>` : ''}
+    ${n.result ? `<div class="detail-result">${n.result.slice(0, 500).replace(/</g, '&lt;')}</div>` : ''}
+  `;
+}
+
+// ─── DATA LOADING ────────────────
+async function loadInitialData() {
+  // Load recent agents
+  const recent = await api('/api/v1/agents/recent?limit=20');
+  (recent.agents || []).forEach(a => addNode(a));
+
+  // Load daemons
+  const daemons = await api('/api/v1/daemons');
+  (daemons.daemons || []).forEach(d => {
+    addNode({
+      id: d.daemon_id,
+      agent_type: d.agent_name || d.agent_type,
+      task_description: d.task_description || `Running every ${d.interval_seconds}s`,
+      status: 'daemon',
+    });
+  });
+
+  // Load god-eye stats
+  const ge = await api('/api/v1/god-eye');
+  document.getElementById('statActive').textContent = ge.active_agents || 0;
+  document.getElementById('statDaemons').textContent = ge.active_daemons || 0;
+
+  renderSidebar();
+}
+
+// ─── SSE ─────────────────────────
+function connectSSE() {
+  const sse = new EventSource(BASE + '/api/v1/events/stream');
+  sse.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (!data.event_type) return;
+
+      sseEvents.push(data);
+      if (sseEvents.length > 200) sseEvents.shift();
+      document.getElementById('statEvents').textContent = sseEvents.length;
+
+      // Add or update node based on event
+      if (data.event_type === 'agent.started' || data.event_type === 'agent_started') {
+        const node = addNode({
+          id: data.agent_id,
+          agent_type: data.agent_type,
+          task_description: data.message,
+          status: 'running',
+        });
+        // Flash effect
+        node.radius = 24;
+        setTimeout(() => { node.radius = 16; }, 500);
+      }
+      else if (data.event_type === 'agent.completed' || data.event_type === 'agent_completed') {
+        const node = nodes.find(n => n.id === data.agent_id);
+        if (node) {
+          node.status = 'completed';
+          node.result = data.data?.result_preview || '';
+        }
+      }
+      else if (data.event_type === 'agent.failed' || data.event_type === 'agent_failed') {
+        const node = nodes.find(n => n.id === data.agent_id);
+        if (node) node.status = 'failed';
+      }
+      else if (data.event_type === 'daemon.alert' || data.event_type === 'daemon_alert') {
+        const node = nodes.find(n => n.id === data.agent_id);
+        if (node) {
+          node.radius = 28;
+          setTimeout(() => { node.radius = 22; }, 1000);
+        }
+      }
+
+      // Update stats
+      const running = nodes.filter(n => n.status === 'running').length;
+      const daemonCount = nodes.filter(n => n.status === 'daemon').length;
+      document.getElementById('statActive').textContent = running;
+      document.getElementById('statDaemons').textContent = daemonCount;
+
+      if (currentTab === 'events') renderSidebar();
+    } catch(x) {}
+  };
+  sse.onerror = () => setTimeout(connectSSE, 5000);
+}
+
+// ─── INIT ────────────────────────
+initCanvas();
+loadInitialData();
+connectSSE();
+render();
+</script>
+</body>
+</html>
