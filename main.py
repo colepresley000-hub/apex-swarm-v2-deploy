@@ -44,6 +44,8 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20241022")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_DEFAULT_CHANNEL = os.getenv("SLACK_DEFAULT_CHANNEL", "#ai-workforce")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "apex_swarm.db")
 PORT = int(os.getenv("PORT", "8080"))
 VERSION = "4.0.0"
@@ -531,6 +533,40 @@ def init_db():
                     cost_usd REAL DEFAULT 0.0,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS orgs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    slug TEXT UNIQUE NOT NULL,
+                    tier TEXT DEFAULT 'enterprise',
+                    owner_email TEXT NOT NULL,
+                    slack_webhook TEXT DEFAULT '',
+                    slack_channel TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS org_members (
+                    id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    role TEXT DEFAULT 'member',
+                    api_key TEXT UNIQUE NOT NULL,
+                    invited_by TEXT,
+                    joined_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS org_invites (
+                    id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    role TEXT DEFAULT 'member',
+                    token TEXT UNIQUE NOT NULL,
+                    created_by TEXT NOT NULL,
+                    used INTEGER DEFAULT 0,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
             # Indexes
             for idx_sql in [
@@ -854,6 +890,59 @@ TIER_LIMITS = {
 }
 
 
+async def send_slack_message(text: str, webhook_url: str = None, channel: str = None, blocks: list = None) -> bool:
+    """Send a message to Slack via webhook."""
+    url = webhook_url or SLACK_WEBHOOK_URL
+    if not url:
+        return False
+    payload = {"text": text}
+    if channel:
+        payload["channel"] = channel
+    if blocks:
+        payload["blocks"] = blocks
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload)
+            return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"Slack send failed: {e}")
+        return False
+
+async def send_slack_agent_result(agent_type: str, agent_name: str, task: str, result: str,
+                                   webhook_url: str = None, channel: str = None):
+    """Send formatted agent result to Slack."""
+    url = webhook_url or SLACK_WEBHOOK_URL
+    if not url:
+        return
+    preview = result[:500] + ("..." if len(result) > 500 else "")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Agent Complete: " + agent_name}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": "*Agent:* " + agent_name},
+            {"type": "mrkdwn", "text": "*Type:* " + agent_type}
+        ]},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Task:* " + task[:200]}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Result:* " + preview}},
+        {"type": "divider"}
+    ]
+    await send_slack_message(f"⚡ {agent_name} completed", webhook_url=url, channel=channel, blocks=blocks)
+
+async def send_slack_daemon_alert(agent_name: str, condition: str, result: str,
+                                   webhook_url: str = None, channel: str = None):
+    """Send daemon alert to Slack."""
+    url = webhook_url or SLACK_WEBHOOK_URL
+    if not url:
+        return
+    preview = result[:600] + ("..." if len(result) > 600 else "")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"🚨 ALERT: {agent_name}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Triggered condition:* `{condition}`"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*Report:* " + preview}},
+        {"type": "divider"}
+    ]
+    await send_slack_message(f"🚨 Alert from {agent_name}", webhook_url=url, channel=channel, blocks=blocks)
+
+
 async def validate_gumroad_license(license_key: str) -> dict:
     """Validate a license key against Gumroad API."""
     try:
@@ -1068,6 +1157,83 @@ async def get_validated_user(x_api_key: str = Header(None), authorization: str =
         raise HTTPException(status_code=403, detail=result.get("error", "Invalid license key"))
 
     return {"api_key": key, "tier": result.get("tier", "starter"), "email": result.get("email", "")}
+
+
+# ─── ENTERPRISE ORG AUTH ─────────────────────────────────
+
+def get_member_by_key(api_key: str):
+    """Look up org member by their API key."""
+    conn = get_db()
+    try:
+        row = db_fetchone(conn,
+            "SELECT m.id, m.org_id, m.email, m.role, o.name as org_name, o.tier, o.slack_webhook, o.slack_channel "
+            "FROM org_members m JOIN orgs o ON m.org_id = o.id WHERE m.api_key = ?",
+            (api_key,)
+        )
+        if row:
+            return {"member_id": row[0], "org_id": row[1], "email": row[2],
+                    "role": row[3], "org_name": row[4], "tier": row[5],
+                    "slack_webhook": row[6], "slack_channel": row[7]}
+        return None
+    finally:
+        conn.close()
+
+def get_org_by_id(org_id: str):
+    conn = get_db()
+    try:
+        row = db_fetchone(conn, "SELECT id, name, slug, tier, owner_email, slack_webhook, slack_channel FROM orgs WHERE id = ?", (org_id,))
+        if row:
+            return {"id": row[0], "name": row[1], "slug": row[2], "tier": row[3],
+                    "owner_email": row[4], "slack_webhook": row[5], "slack_channel": row[6]}
+        return None
+    finally:
+        conn.close()
+
+async def get_validated_org_user(x_api_key: str = Header(None), authorization: str = Header(None)) -> dict:
+    """Validate API key — checks org members first, falls back to Gumroad license."""
+    key = x_api_key or ""
+    if not key and authorization:
+        key = authorization.replace("Bearer ", "")
+    if not key:
+        raise HTTPException(status_code=401, detail="API key required.")
+    if ADMIN_API_KEY and key == ADMIN_API_KEY:
+        return {"api_key": key, "tier": "admin", "email": "admin", "org_id": None, "role": "admin"}
+    # Check org member first
+    member = get_member_by_key(key)
+    if member:
+        return {"api_key": key, "tier": member["tier"], "email": member["email"],
+                "org_id": member["org_id"], "role": member["role"],
+                "org_name": member["org_name"], "slack_webhook": member["slack_webhook"],
+                "slack_channel": member["slack_channel"]}
+    # Fall back to Gumroad license
+    result = await get_or_validate_license(key)
+    if not result.get("valid"):
+        raise HTTPException(status_code=403, detail=result.get("error", "Invalid license key"))
+    return {"api_key": key, "tier": result.get("tier", "starter"), "email": result.get("email", ""),
+            "org_id": None, "role": "owner", "slack_webhook": "", "slack_channel": ""}
+
+
+# ─── ORG MANAGEMENT ENDPOINTS ────────────────────────────
+
+class CreateOrgRequest(BaseModel):
+    name: str
+    slug: str
+    owner_email: str
+    slack_webhook: Optional[str] = ""
+    slack_channel: Optional[str] = ""
+
+class InviteMemberRequest(BaseModel):
+    email: str
+    role: str = "member"
+
+class AcceptInviteRequest(BaseModel):
+    token: str
+    email: str
+
+class UpdateOrgRequest(BaseModel):
+    slack_webhook: Optional[str] = None
+    slack_channel: Optional[str] = None
+    name: Optional[str] = None
 
 
 # ─── KNOWLEDGE RETRIEVAL ─────────────────────────────────
@@ -1334,6 +1500,13 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
                         data={"triggered_keywords": triggered},
                     ))
                     logger.info(f"🚨 Daemon alert fired for {agent_id[:8]}: {triggered}")
+                    # Send to Slack
+                    if SLACK_WEBHOOK_URL:
+                        asyncio.create_task(send_slack_daemon_alert(
+                            agent_name=agent.get("name", agent_type),
+                            condition=", ".join(triggered) if triggered else "ALERT",
+                            result=result or "",
+                        ))
             except Exception as e:
                 logger.error(f"Daemon alert check failed: {e}")
 
@@ -1359,6 +1532,36 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
                 }, user_api_key)
             except Exception as e:
                 logger.error(f"Workflow trigger failed: {e}")
+
+        # ── SLACK OUTPUT: Send result to org Slack if configured ──
+        if result and SLACK_WEBHOOK_URL:
+            try:
+                # Check if this is a daemon run (skip — daemon alerts handled separately)
+                if not (user_api_key and user_api_key.startswith("daemon:")):
+                    asyncio.create_task(send_slack_agent_result(
+                        agent_type=agent_type,
+                        agent_name=agent.get("name", agent_type),
+                        task=task_description,
+                        result=result,
+                    ))
+            except Exception as e:
+                logger.error(f"Slack output failed: {e}")
+
+        # ── SLACK OUTPUT: Check org member's Slack config ──
+        if result and user_api_key and not user_api_key.startswith("daemon:"):
+            try:
+                member = get_member_by_key(user_api_key)
+                if member and member.get("slack_webhook"):
+                    asyncio.create_task(send_slack_agent_result(
+                        agent_type=agent_type,
+                        agent_name=agent.get("name", agent_type),
+                        task=task_description,
+                        result=result,
+                        webhook_url=member["slack_webhook"],
+                        channel=member["slack_channel"],
+                    ))
+            except Exception as e:
+                logger.error(f"Org Slack output failed: {e}")
 
         return result
 
@@ -1837,6 +2040,120 @@ async def lifespan(app: FastAPI):
 # ─── FASTAPI APP ──────────────────────────────────────────
 
 app = FastAPI(title="APEX SWARM", version=VERSION, lifespan=lifespan)
+
+@app.post("/api/v1/orgs")
+async def create_org(req: CreateOrgRequest, api_key: str = Depends(get_api_key)):
+    """Create a new organization."""
+    import re
+    slug = re.sub(r'[^a-z0-9-]', '-', req.slug.lower()).strip('-')
+    org_id = str(uuid.uuid4())
+    member_id = str(uuid.uuid4())
+    member_key = f"ak-{str(uuid.uuid4()).replace('-', '')[:32]}"
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        db_execute(conn, "INSERT INTO orgs (id, name, slug, tier, owner_email, slack_webhook, slack_channel, created_at) VALUES (?, ?, ?, 'enterprise', ?, ?, ?, ?)",
+                   (org_id, req.name, slug, req.owner_email, req.slack_webhook or "", req.slack_channel or "", now))
+        db_execute(conn, "INSERT INTO org_members (id, org_id, email, role, api_key, joined_at, created_at) VALUES (?, ?, ?, 'owner', ?, ?, ?)",
+                   (member_id, org_id, req.owner_email, member_key, now, now))
+        conn.commit()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+    return {"org_id": org_id, "slug": slug, "owner_api_key": member_key, "message": f"Organization '{req.name}' created"}
+
+@app.get("/api/v1/orgs/{org_id}")
+async def get_org(org_id: str, api_key: str = Depends(get_api_key)):
+    org = get_org_by_id(org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Org not found")
+    conn = get_db()
+    try:
+        members = db_fetchall(conn, "SELECT id, email, role, api_key, joined_at FROM org_members WHERE org_id = ?", (org_id,))
+    finally:
+        conn.close()
+    return {"org": org, "members": [{"id": m[0], "email": m[1], "role": m[2], "api_key": m[3][:8]+"...", "joined_at": m[4]} for m in members]}
+
+@app.put("/api/v1/orgs/{org_id}")
+async def update_org(org_id: str, req: UpdateOrgRequest, api_key: str = Depends(get_api_key)):
+    conn = get_db()
+    try:
+        if req.slack_webhook is not None:
+            db_execute(conn, "UPDATE orgs SET slack_webhook = ? WHERE id = ?", (req.slack_webhook, org_id))
+        if req.slack_channel is not None:
+            db_execute(conn, "UPDATE orgs SET slack_channel = ? WHERE id = ?", (req.slack_channel, org_id))
+        if req.name is not None:
+            db_execute(conn, "UPDATE orgs SET name = ? WHERE id = ?", (req.name, org_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "updated"}
+
+@app.post("/api/v1/orgs/{org_id}/invite")
+async def invite_member(org_id: str, req: InviteMemberRequest, api_key: str = Depends(get_api_key)):
+    """Invite a team member to the org."""
+    token = str(uuid.uuid4()).replace("-", "")
+    invite_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    expires = datetime.fromtimestamp(now.timestamp() + 7*24*3600, tz=timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        db_execute(conn, "INSERT INTO org_invites (id, org_id, email, role, token, created_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   (invite_id, org_id, req.email, req.role, token, api_key, expires, now.isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    base_url = os.getenv("BASE_URL", "https://apex-swarm-v2-production.up.railway.app")
+    invite_url = f"{base_url}/accept-invite?token={token}"
+    return {"invite_url": invite_url, "token": token, "email": req.email, "expires_at": expires}
+
+@app.post("/api/v1/orgs/accept-invite")
+async def accept_invite(req: AcceptInviteRequest):
+    """Accept an org invite and get an API key."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        invite = db_fetchone(conn, "SELECT id, org_id, email, role, expires_at, used FROM org_invites WHERE token = ?", (req.token,))
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found")
+        if invite[5]:
+            raise HTTPException(status_code=400, detail="Invite already used")
+        if invite[4] < now:
+            raise HTTPException(status_code=400, detail="Invite expired")
+        member_id = str(uuid.uuid4())
+        member_key = f"ak-{str(uuid.uuid4()).replace('-', '')[:32]}"
+        db_execute(conn, "INSERT INTO org_members (id, org_id, email, role, api_key, joined_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (member_id, invite[1], req.email, invite[2], member_key, now, now))
+        db_execute(conn, "UPDATE org_invites SET used = 1 WHERE id = ?", (invite[0],))
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+    return {"api_key": member_key, "org_id": invite[1], "role": invite[2], "message": "Welcome to the team!"}
+
+@app.get("/api/v1/orgs/{org_id}/members")
+async def list_members(org_id: str, api_key: str = Depends(get_api_key)):
+    conn = get_db()
+    try:
+        members = db_fetchall(conn, "SELECT id, email, role, api_key, joined_at FROM org_members WHERE org_id = ?", (org_id,))
+    finally:
+        conn.close()
+    return {"members": [{"id": m[0], "email": m[1], "role": m[2], "api_key": m[3][:8]+"...", "joined_at": m[4]} for m in members]}
+
+@app.delete("/api/v1/orgs/{org_id}/members/{member_id}")
+async def remove_member(org_id: str, member_id: str, api_key: str = Depends(get_api_key)):
+    conn = get_db()
+    try:
+        db_execute(conn, "DELETE FROM org_members WHERE id = ? AND org_id = ?", (member_id, org_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "removed"}
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -3433,6 +3750,36 @@ async def slack_webhook(request: Request):
     return {"ok": True}
 
 
+@app.post("/api/v1/slack/configure")
+async def configure_slack(request: Request, api_key: str = Depends(get_api_key)):
+    """Configure Slack webhook for this user/org."""
+    data = await request.json()
+    webhook = data.get("webhook_url", "")
+    channel = data.get("channel", "#ai-workforce")
+    # If org member, update their org
+    member = get_member_by_key(api_key)
+    if member:
+        conn = get_db()
+        try:
+            db_execute(conn, "UPDATE orgs SET slack_webhook = ?, slack_channel = ? WHERE id = ?",
+                      (webhook, channel, member["org_id"]))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"status": "configured", "scope": "org", "org_id": member["org_id"]}
+    return {"status": "configured", "scope": "global", "note": "Set SLACK_WEBHOOK_URL env var for persistent config"}
+
+@app.post("/api/v1/slack/test")
+async def test_slack(request: Request, api_key: str = Depends(get_api_key)):
+    """Send a test message to Slack."""
+    data = await request.json()
+    webhook = data.get("webhook_url") or SLACK_WEBHOOK_URL
+    if not webhook:
+        raise HTTPException(status_code=400, detail="No Slack webhook configured")
+    ok = await send_slack_message("✅ APEX SWARM connected to Slack! Your AI workforce is ready.", webhook_url=webhook)
+    return {"success": ok}
+
+
 @app.get("/api/v1/channels")
 async def list_channels():
     """List all configured messaging channels."""
@@ -3697,6 +4044,7 @@ body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;point
       <div class="nav-group-label">Intelligence</div>
       <div class="nav-btn" data-p="goals" onclick="go('goals')"><span class="icon">◆</span> Goals<span class="nav-badge">NEW</span></div>
       <div class="nav-btn" data-p="a2a" onclick="go('a2a')"><span class="icon">◇</span> Swarm Delegate</div>
+      <div class="nav-btn" data-p="swarm" onclick="go('swarm')"><span class="icon">⬡</span> Live Swarm</div>
       <div class="nav-btn" data-p="daemons" onclick="go('daemons')"><span class="icon">◌</span> Daemons</div>
       <div class="nav-btn" data-p="workflows" onclick="go('workflows')"><span class="icon">⬡</span> Workflows</div>
     </div>
@@ -3704,7 +4052,8 @@ body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;point
       <div class="nav-group-label">Platform</div>
       <div class="nav-btn" data-p="marketplace" onclick="go('marketplace')"><span class="icon">◫</span> Marketplace</div>
       <div class="nav-btn" data-p="models" onclick="go('models')"><span class="icon">◑</span> Models</div>
-      <div class="nav-btn" data-p="org" onclick="go('org')"><span class="icon">◰</span> Org Chart</div>
+      <div class="nav-btn" data-p="team" onclick="go('team')"><span class="icon">◰</span> Team</div>
+      <div class="nav-btn" data-p="org" onclick="go('org')"><span class="icon">◑</span> Org Chart</div>
       <div class="nav-btn" data-p="settings" onclick="go('settings')"><span class="icon">◎</span> System</div>
     </div>
 
@@ -3754,7 +4103,7 @@ function go(p) {
   page = p;
   $$('.nav-btn').forEach(n => n.classList.toggle('active', n.dataset.p === p));
   $('#main').innerHTML = '<div style="display:flex;justify-content:center;padding:60px"><div class="spin"></div></div>';
-  const R = {overview:pOverview,deploy:pDeploy,agents:pAgents,feed:pFeed,goals:pGoals,a2a:pA2A,daemons:pDaemons,workflows:pWorkflows,marketplace:pMarketplace,models:pModels,org:pOrg,settings:pSettings};
+  const R = {overview:pOverview,deploy:pDeploy,agents:pAgents,feed:pFeed,goals:pGoals,a2a:pA2A,swarm:pSwarm,daemons:pDaemons,workflows:pWorkflows,marketplace:pMarketplace,models:pModels,team:pTeam,org:pOrg,settings:pSettings};
   (R[p]||pOverview)();
 }
 
@@ -3896,6 +4245,145 @@ async function doA2A() {
 }
 
 // ─── DAEMONS ──────────────────────────
+async function pSwarm() {
+  const [daemonRes, evtRes, agentRes] = await Promise.all([
+    api('/api/v1/daemons'),
+    api('/api/v1/events?limit=30'),
+    api('/api/v1/agents/recent')
+  ]);
+  const daemons = daemonRes.daemons || [];
+  const evts = (evtRes.events || []).filter(e => e.event_type);
+  const agents = agentRes.agents || [];
+  const running = daemons.filter(d => d.status === 'running');
+  const alerts = evts.filter(e => e.event_type === 'daemon.alert');
+
+  $('#main').innerHTML = `<div class="page fade-up">
+    <div class="page-header">
+      <div class="page-title">⬡ Live Swarm</div>
+      <div class="page-subtitle">${running.length} active daemons · ${agents.filter(a=>a.status==='running').length} agents running · ${alerts.length} alerts today</div>
+    </div>
+
+    <div class="metrics" style="margin-bottom:20px">
+      <div class="metric-card"><div class="metric-val" style="color:var(--mint)">${running.length}</div><div class="metric-label">Active Daemons</div></div>
+      <div class="metric-card"><div class="metric-val" style="color:var(--amber)">${alerts.length}</div><div class="metric-label">Alerts Fired</div></div>
+      <div class="metric-card"><div class="metric-val" style="color:var(--violet)">${evts.filter(e=>e.event_type==='agent.completed').length}</div><div class="metric-label">Tasks Completed</div></div>
+      <div class="metric-card"><div class="metric-val" style="color:var(--text)">${evts.length}</div><div class="metric-label">Total Events</div></div>
+    </div>
+
+    <div class="g2">
+      <div>
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-head">
+            <div class="card-title">🤖 AI Workforce — Active</div>
+            <button class="btn btn-mint btn-sm" onclick="startDaemon()">+ Deploy Worker</button>
+          </div>
+          <div class="card-body">
+            ${running.length ? running.map(d => `
+              <div style="padding:14px;background:var(--bg);border-radius:10px;margin-bottom:10px;border:1px solid var(--border)">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <div class="dot live" style="animation:pulse 2s infinite"></div>
+                    <span style="font-weight:600;font-size:14px">${d.agent_name}</span>
+                    <span style="font-size:11px;background:var(--mintbg);color:var(--mint);padding:2px 8px;border-radius:8px">${d.agent_type}</span>
+                  </div>
+                  <button class="btn btn-sm" style="color:var(--rose);font-size:11px" onclick="stopDaemon('${d.daemon_id}')">Stop</button>
+                </div>
+                <div style="font-size:12px;color:var(--text3);margin-bottom:6px">${d.task.slice(0,120)}...</div>
+                <div style="display:flex;gap:16px;font-size:11px;color:var(--text2)">
+                  <span>🔄 Cycle ${d.cycles}</span>
+                  <span>⏱ Every ${d.interval_seconds}s</span>
+                  <span>🕐 ${new Date(d.created_at).toLocaleTimeString()}</span>
+                </div>
+                ${d.last_result_preview ? `<div style="margin-top:8px;font-size:11px;color:var(--text2);background:var(--bg2);padding:8px;border-radius:6px;max-height:60px;overflow:hidden">${d.last_result_preview.slice(0,200)}</div>` : ''}
+              </div>`).join('') : `
+              <div style="text-align:center;padding:40px;color:var(--text3)">
+                <div style="font-size:32px;margin-bottom:12px">◌</div>
+                No active workers. Deploy your first AI worker.
+              </div>`}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><div class="card-title">🚨 Recent Alerts</div></div>
+          <div class="card-body" style="max-height:250px;overflow-y:auto">
+            ${alerts.length ? alerts.slice().reverse().slice(0,10).map(e => `
+              <div style="padding:10px;background:rgba(255,180,0,0.05);border:1px solid rgba(255,180,0,0.15);border-radius:8px;margin-bottom:8px">
+                <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+                  <span style="font-weight:600;font-size:12px;color:var(--amber)">${e.agent_name}</span>
+                  <span style="font-size:11px;color:var(--text3)">${new Date(e.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <div style="font-size:12px;color:var(--text2)">${(e.message||'').slice(0,150)}</div>
+              </div>`).join('') : '<div style="text-align:center;padding:20px;color:var(--text3);font-size:13px">No alerts — all clear ✓</div>'}
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-head"><div class="card-title">⚡ Live Activity Stream</div></div>
+          <div class="card-body" id="swarmFeed" style="max-height:400px;overflow-y:auto">
+            ${evts.length ? evts.slice().reverse().map(e => `
+              <div class="event-item">
+                <div class="event-dot" style="background:${e.event_type?.includes('alert')?'var(--amber)':e.event_type?.includes('fail')?'var(--rose)':e.event_type?.includes('start')?'var(--violet)':'var(--mint)'}"></div>
+                <div class="event-content">
+                  <strong>${e.agent_name||e.agent_type||'system'}</strong>
+                  <span style="font-size:11px;color:var(--text3);margin-left:6px">${e.event_type}</span>
+                  <div style="color:var(--text2);font-size:12px;margin-top:2px">${(e.message||'').slice(0,120)}</div>
+                  <div class="event-time">${new Date(e.timestamp).toLocaleTimeString()}</div>
+                </div>
+              </div>`).join('') : '<div style="text-align:center;padding:20px;color:var(--text3)">Waiting for activity...</div>'}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><div class="card-title">📤 Output Channels</div></div>
+          <div class="card-body">
+            <div class="agent-row" style="margin-bottom:8px">
+              <div class="dot ${evts.length ? 'live' : 'idle'}"></div>
+              <div class="agent-name">Telegram</div>
+              <span class="agent-badge badge-done">Connected</span>
+            </div>
+            <div class="agent-row" style="margin-bottom:8px">
+              <div class="dot idle" id="slackDot"></div>
+              <div class="agent-name">Slack</div>
+              <span class="agent-badge" id="slackBadge" style="cursor:pointer" onclick="configureSlack()">Configure →</span>
+            </div>
+            <div class="agent-row">
+              <div class="dot idle"></div>
+              <div class="agent-name">Email</div>
+              <span class="agent-badge">Coming Soon</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  // Auto-refresh every 15s while on this page
+  setTimeout(() => { if(page==='swarm') pSwarm(); }, 15000);
+}
+
+async function startDaemon() {
+  const preset = prompt('Enter preset ID (e.g. crypto-monitor):');
+  if (!preset) return;
+  const r = await api('/api/v1/daemons', {method:'POST', body: JSON.stringify({preset_id: preset})});
+  if (r.daemon_id) { alert('Worker deployed: ' + r.name); pSwarm(); }
+  else alert('Error: ' + (r.detail || JSON.stringify(r)));
+}
+
+async function configureSlack() {
+  const webhook = prompt('Enter your Slack Webhook URL:');
+  if (!webhook) return;
+  const channel = prompt('Enter channel (e.g. #ai-workforce):', '#ai-workforce');
+  const r = await api('/api/v1/slack/configure', {method:'POST', body: JSON.stringify({webhook_url: webhook, channel: channel})});
+  if (r.status === 'configured') {
+    // Test it
+    await api('/api/v1/slack/test', {method:'POST', body: JSON.stringify({webhook_url: webhook})});
+    alert('✅ Slack configured! Check your channel for a test message.');
+    pSwarm();
+  }
+}
+
 async function pDaemons() {
   const r=await api('/api/v1/daemons');
   const daemons=r.daemons||[];const presets=r.presets||{};
@@ -3941,6 +4429,118 @@ async function pModels() {
 }
 
 // ─── ORG CHART ──────────────────────────
+async function pTeam() {
+  $('#main').innerHTML = `<div class="page fade-up">
+    <div class="page-header">
+      <div class="page-title">◰ Team</div>
+      <div class="page-subtitle">Manage your AI workforce team and access</div>
+    </div>
+    <div class="g2">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Create Organization</div>
+        </div>
+        <div class="card-body">
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Org Name</label>
+            <input class="input" id="orgName" placeholder="Acme Corp" style="margin-top:6px">
+          </div>
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Slug</label>
+            <input class="input" id="orgSlug" placeholder="acme-corp" style="margin-top:6px">
+          </div>
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Owner Email</label>
+            <input class="input" id="orgEmail" placeholder="admin@acme.com" style="margin-top:6px">
+          </div>
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Slack Webhook (optional)</label>
+            <input class="input" id="orgSlack" placeholder="https://hooks.slack.com/..." style="margin-top:6px">
+          </div>
+          <button class="btn btn-mint" onclick="createOrg()">Create Organization</button>
+          <div id="orgResult" style="margin-top:12px;font-size:12px;color:var(--mint)"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Invite Team Member</div>
+        </div>
+        <div class="card-body">
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Org ID</label>
+            <input class="input" id="inviteOrgId" placeholder="org-id from creation" style="margin-top:6px">
+          </div>
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Email</label>
+            <input class="input" id="inviteEmail" placeholder="teammate@acme.com" style="margin-top:6px">
+          </div>
+          <div style="margin-bottom:12px">
+            <label style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px">Role</label>
+            <select class="input" id="inviteRole" style="margin-top:6px">
+              <option value="member">Member</option>
+              <option value="admin">Admin</option>
+              <option value="viewer">Viewer</option>
+            </select>
+          </div>
+          <button class="btn btn-mint" onclick="inviteMember()">Send Invite</button>
+          <div id="inviteResult" style="margin-top:12px;font-size:12px;color:var(--mint)"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-head"><div class="card-title">Accept Invite</div></div>
+      <div class="card-body" style="display:flex;gap:12px;flex-wrap:wrap">
+        <input class="input" id="inviteToken" placeholder="Invite token" style="flex:1;min-width:200px">
+        <input class="input" id="acceptEmail" placeholder="Your email" style="flex:1;min-width:200px">
+        <button class="btn btn-mint" onclick="acceptInvite()">Accept & Get API Key</button>
+      </div>
+      <div id="acceptResult" style="margin-top:12px;font-size:12px;color:var(--mint);padding:0 20px 16px"></div>
+    </div>
+  </div>`;
+}
+
+async function createOrg() {
+  const name = $('#orgName').value.trim();
+  const slug = $('#orgSlug').value.trim();
+  const email = $('#orgEmail').value.trim();
+  const slack = $('#orgSlack').value.trim();
+  if (!name || !slug || !email) { alert('Fill in org name, slug, and email'); return; }
+  const r = await api('/api/v1/orgs', {method:'POST', body: JSON.stringify({name, slug, owner_email: email, slack_webhook: slack})});
+  if (r.org_id) {
+    $('#orgResult').innerHTML = `✅ Created! <br>Org ID: <code>${r.org_id}</code><br>Your API Key: <code>${r.owner_api_key}</code>`;
+    $('#inviteOrgId').value = r.org_id;
+  } else {
+    $('#orgResult').textContent = 'Error: ' + (r.detail || JSON.stringify(r));
+  }
+}
+
+async function inviteMember() {
+  const org_id = $('#inviteOrgId').value.trim();
+  const email = $('#inviteEmail').value.trim();
+  const role = $('#inviteRole').value;
+  if (!org_id || !email) { alert('Fill in org ID and email'); return; }
+  const r = await api('/api/v1/orgs/' + org_id + '/invite', {method:'POST', body: JSON.stringify({email, role})});
+  if (r.invite_url) {
+    $('#inviteResult').innerHTML = `✅ Invite sent!<br>URL: <a href="${r.invite_url}" style="color:var(--mint)">${r.invite_url}</a>`;
+  } else {
+    $('#inviteResult').textContent = 'Error: ' + (r.detail || JSON.stringify(r));
+  }
+}
+
+async function acceptInvite() {
+  const token = $('#inviteToken').value.trim();
+  const email = $('#acceptEmail').value.trim();
+  if (!token || !email) { alert('Fill in token and email'); return; }
+  const r = await api('/api/v1/orgs/accept-invite', {method:'POST', body: JSON.stringify({token, email})});
+  if (r.api_key) {
+    $('#acceptResult').innerHTML = `✅ Welcome! Your API Key: <code style="background:var(--bg2);padding:4px 8px;border-radius:4px">${r.api_key}</code><br>Save this — it won't be shown again.`;
+  } else {
+    $('#acceptResult').textContent = 'Error: ' + (r.detail || JSON.stringify(r));
+  }
+}
+
 async function pOrg() {
   const r=await api('/api/v1/roles');
   $('#main').innerHTML=`<div class="page fade-up"><div class="page-header"><div class="page-title">Organization Chart</div><div class="page-subtitle">Role-based agent permissions and capabilities</div></div>
