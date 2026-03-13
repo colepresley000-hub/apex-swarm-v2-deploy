@@ -759,6 +759,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
                 ("knowledge", "category", "TEXT DEFAULT 'general'"),
                 ("knowledge", "source_agent", "TEXT DEFAULT ''"),
                 ("knowledge", "version", "INTEGER DEFAULT 1"),
+                ("audit_log", "flagged", "BOOLEAN DEFAULT FALSE"),
             ]
             for table, col, col_type in migration_columns:
                 try:
