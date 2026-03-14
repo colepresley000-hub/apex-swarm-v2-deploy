@@ -3962,6 +3962,13 @@ async def stop_daemon(daemon_id: str, api_key: str = Depends(get_api_key)):
             break
     if not found:
         raise HTTPException(status_code=404, detail="Daemon not found")
+    # Disable in DB first so alerts stop immediately even if task takes time to cancel
+    conn = get_db()
+    try:
+        conn.execute("UPDATE daemon_configs SET enabled = 0 WHERE id = ?", (found,))
+        conn.commit()
+    finally:
+        conn.close()
     await daemon_manager.stop_daemon(found)
     remove_daemon_config(found)
     return {"status": "stopped", "daemon_id": found}
@@ -7084,7 +7091,10 @@ async function configureSlack() {
 }
 
 async function stopDaemon(id) {
-  await api('/api/v1/daemons/'+id,{method:'DELETE'});
+  if (!confirm('Stop this daemon? It will stop sending alerts.')) return;
+  try {
+    await api('/api/v1/daemons/'+id,{method:'DELETE'});
+  } catch(e) {}
   pSwarm();
 }
 
@@ -7307,7 +7317,7 @@ async function pDaemons() {
     <div class="card"><div class="card-head"><div class="card-title">Running</div></div><div class="card-body">${daemons.map(d=>`<div class="agent-row"><div class="dot ${d.status==='running'?'live':'err'}"></div><div class="agent-info"><div class="agent-name">${d.agent_name}</div><div class="agent-task">${d.cycles} cycles</div></div><button class="btn btn-sm" style="color:var(--rose)" onclick="stopDaemon('${d.daemon_id}')">Stop</button></div>`).join('')||'<div style="text-align:center;padding:20px;color:var(--text3)">No daemons running</div>'}</div></div></div>`;
 }
 async function startDaemon(id){await api('/api/v1/daemons',{method:'POST',body:JSON.stringify({preset_id:id})});pDaemons();}
-async function stopDaemon(id){await api('/api/v1/daemons/'+id,{method:'DELETE'});pDaemons();}
+async function stopDaemon(id){if(!confirm('Stop this daemon?'))return;try{await api('/api/v1/daemons/'+id,{method:'DELETE'});}catch(e){}pDaemons();}
 
 // ─── WORKFLOWS ──────────────────────────
 async function pWorkflows() {
