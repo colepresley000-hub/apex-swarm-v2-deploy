@@ -467,7 +467,7 @@ class DaemonManager:
             if daemon_id in self._daemons:
                 self._daemons[daemon_id]["status"] = "stopped"
 
-    async def stop_daemon(self, daemon_id: str) -> bool:
+    async async def stop_daemon(self, daemon_id: str) -> bool:
         """Stop a running daemon."""
         if daemon_id not in self._daemons:
             return False

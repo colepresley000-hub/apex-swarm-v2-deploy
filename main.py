@@ -6583,7 +6583,7 @@ const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 let KEY = localStorage.getItem('apex_key') || '';
 let BASE = location.origin;
-if(!KEY){KEY='dev-mode';localStorage.setItem('apex_key','dev-mode');}
+if(!KEY){ window.location.href='/login'; }
 let page = 'overview';
 let events = [];
 let sse = null;
@@ -7472,7 +7472,8 @@ async function pSettings() {
       </div></div>
       <div class="card"><div class="card-head"><div class="card-title">Channels</div></div><div class="card-body">${Object.entries(m||{}).map(([n,i])=>`<div class="agent-row"><div class="dot ${i.enabled?'live':'idle'}"></div><div class="agent-name" style="text-transform:capitalize">${n}</div><span class="agent-badge ${i.enabled?'badge-done':'badge-err'}">${i.enabled?'Connected':'Off'}</span></div>`).join('')}</div></div>
     </div>
-    <div class="card" style="margin-top:14px"><div class="card-head"><div class="card-title">API Key</div></div><div class="card-body"><input class="input" id="sKey" value="${KEY}" style="font-family:'IBM Plex Mono',monospace;font-size:12px"><button class="btn btn-mint btn-sm" style="margin-top:10px" onclick="KEY=$('#sKey').value;localStorage.setItem('apex_key',KEY)">Save</button></div></div></div>`;
+    <div class="card" style="margin-top:14px"><div class="card-head"><div class="card-title">Platform API Key</div></div><div class="card-body"><div style="font-size:12px;color:var(--text3);margin-bottom:8px">Your APEX SWARM platform key (auto-assigned at signup)</div><input class="input" id="sKey" value="${KEY}" style="font-family:'IBM Plex Mono',monospace;font-size:12px" readonly></div></div>
+      <div class="card" style="margin-top:14px"><div class="card-head"><div class="card-title">Anthropic API Key (BYOK)</div></div><div class="card-body"><div style="font-size:12px;color:var(--text3);margin-bottom:8px">Your personal Anthropic key — agents use this to run. Never shared. <a href="https://console.anthropic.com" target="_blank" style="color:var(--mint)">Get one →</a></div><input class="input" id="sAnthropicKey" value="${localStorage.getItem('apex_anthropic_key')||''}" placeholder="sk-ant-..." style="font-family:'IBM Plex Mono',monospace;font-size:12px"><button class="btn btn-mint btn-sm" style="margin-top:10px" onclick="localStorage.setItem('apex_anthropic_key',$('#sAnthropicKey').value);alert('Anthropic key saved locally.')">Save Key</button></div></div></div>`;
 }
 
 // ─── SSE ──────────────────────────
