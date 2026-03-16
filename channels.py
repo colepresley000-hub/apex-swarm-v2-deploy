@@ -221,6 +221,42 @@ class CommandRouter:
         self._get_db = get_db
         self._user_key_col = user_key_col
 
+    async def _execute_and_reply(self, msg, agent_id, agent_type, task):
+        """Execute an agent task and send result back to channel."""
+        try:
+            import asyncio, uuid
+            from datetime import datetime, timezone
+            # We need access to execute_task - import from main context
+            # Use the REST API instead to avoid circular imports
+            import httpx, os
+            base = os.getenv("BASE_URL", "https://swarmsfall.com")
+            api_key = os.getenv("ADMIN_API_KEY", "dev-mode")
+            async with httpx.AsyncClient(timeout=120) as client:
+                # Deploy
+                r = await client.post(f"{base}/api/v1/deploy",
+                    headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                    json={"agent_type": agent_type, "task_description": task})
+                data = r.json()
+                aid = data.get("agent_id")
+                if not aid:
+                    await send_to_channel(msg, f"Failed to start agent: {data.get('detail','unknown error')}")
+                    return
+                # Poll for result
+                for _ in range(60):
+                    await asyncio.sleep(3)
+                    sr = await client.get(f"{base}/api/v1/status/{aid}",
+                        headers={"X-API-Key": api_key})
+                    sd = sr.json()
+                    if sd.get("status") in ("completed", "failed"):
+                        result = sd.get("result", "No result")
+                        # Send in chunks if long
+                        for i in range(0, len(result), 3800):
+                            await send_to_channel(msg, result[i:i+3800])
+                        return
+                await send_to_channel(msg, "Agent timed out after 3 minutes")
+        except Exception as e:
+            await send_to_channel(msg, f"Error: {str(e)[:200]}")
+
     async def handle(self, msg: ChannelMessage):
         """Route a message to the correct handler."""
         text = msg.text
@@ -235,6 +271,23 @@ class CommandRouter:
         else:
             command = None
             args = text
+
+        # ─── SLASH SKILLS (check before anything else) ─────
+        try:
+            from slash_skills import SLASH_SKILLS, parse_slash_command, apply_skill
+            skill_key, remaining = parse_slash_command(text)
+            if skill_key:
+                skill = apply_skill(skill_key, remaining)
+                agent_type = skill["agent_type"]
+                task = skill["system_prompt"] + "\n\n---\nTASK:\n" + remaining
+                await send_to_channel(msg, f"Running {skill['skill']['name']} mode...")
+                import uuid, asyncio
+                from datetime import datetime, timezone
+                agent_id = str(uuid.uuid4())
+                asyncio.create_task(self._execute_and_reply(msg, agent_id, agent_type, task))
+                return
+        except Exception:
+            pass
 
         # ─── HELP / START ─────
         if command in ("start", "help"):
