@@ -258,6 +258,25 @@ class CommandRouter:
             await send_to_channel(msg, welcome)
             return
 
+        # ─── SKILLS ──
+        if command == "skills":
+            skills_text = (
+                "APEX SWARM — Slash Skills\n\n"
+                "/plan-ceo-review — Find the 10-star product\n"
+                "/plan-eng-review — Architecture & edge cases\n"
+                "/review — Paranoid code review\n"
+                "/ship — Release checklist & deploy\n"
+                "/browse — QA pass on any URL\n"
+                "/retro — Weekly engineering retro\n"
+                "/analyze — Deep analysis, no surface takes\n"
+                "/draft — Complete first draft, no placeholders\n"
+                "/threat-model — STRIDE security analysis\n"
+                "/monetize — Fastest path to first dollar\n\n"
+                "Usage: /monetize my SaaS idea here"
+            )
+            await send_to_channel(msg, skills_text)
+            return
+
         # ─── GOD EYE ─────
         if command in ("god-eye", "god_eye", "status"):
             if not self._event_bus:
