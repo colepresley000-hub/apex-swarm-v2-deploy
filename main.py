@@ -2462,26 +2462,21 @@ async def handle_telegram_message(message: dict):
     # ─── MISSION CONTROL COMMANDS ─────
     if agent_type == "start":
         welcome = (
-            "🤖 *APEX SWARM v3.1 — Mission Control*\n\n"
-            "*Agent Commands:*\n"
+            "APEX SWARM — Mission Control\n\n"
+            "AGENT COMMANDS:\n"
             "/research Your question\n"
             "/crypto-research Analyze ETH\n"
             "/blog-writer Write about AI\n\n"
-            "*Mission Control:*\n"
-            "/god\\_eye — Live status overview\n"
-            "/daemons — List running daemons\n"
-            "/start\\_daemon <preset> — Start a daemon\n"
-            "/stop\\_daemon <id> — Stop a daemon\n"
-            "/subscribe — Get live agent feed\n"
-            "/unsubscribe — Stop live feed\n"
-            "/events — Recent activity log\n\n"
-            "*Daemon Presets:*\n"
-            "crypto-monitor, defi-yield-scanner,\n"
-            "news-sentinel, whale-watcher, competitor-tracker\n\n"
-            "*Slash Skills:*\n"
-            "/skills — List all specialist modes\n"
-            "/review, /plan-ceo-review, /ship, /browse, /retro\n"
-            "/analyze, /draft, /threat-model, /monetize"
+            "MISSION CONTROL:\n"
+            "/god_eye — Live status\n"
+            "/daemons — List daemons\n"
+            "/start_daemon crypto-monitor\n"
+            "/stop_daemon <id> — Stop daemon\n"
+            "/subscribe — Live feed\n"
+            "/events — Recent activity\n\n"
+            "SLASH SKILLS:\n"
+            "/skills — See all modes\n"
+            "/review /monetize /ship /analyze /draft"
         )
         await send_telegram(chat_id, welcome)
         return
@@ -2694,6 +2689,19 @@ async def lifespan(app: FastAPI):
         if SLACK_ENABLED: channels_active.append("Slack")
         if channels_active:
             logger.info(f"💬 Channels active: {', '.join(channels_active)}")
+
+    # Register Telegram webhook on startup
+    if TELEGRAM_ENABLED and TELEGRAM_BOT_TOKEN:
+        try:
+            base = os.getenv("BASE_URL", "https://swarmsfall.com")
+            async with __import__("httpx").AsyncClient() as client:
+                r = await client.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+                    json={"url": f"{base}/api/v1/telegram/webhook"}
+                )
+                logger.info(f"✅ Telegram webhook registered: {r.json().get('description','')}")
+        except Exception as e:
+            logger.warning(f"⚠️ Telegram webhook setup failed: {e}")
 
     # Restore persistent daemons
     await restore_daemons()
