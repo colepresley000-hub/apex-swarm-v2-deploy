@@ -61,7 +61,7 @@ async def send_telegram(chat_id, text: str):
         async with httpx.AsyncClient() as client:
             await client.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                json={"chat_id": chat_id, "text": text[:4000]},
             )
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
@@ -333,10 +333,10 @@ class CommandRouter:
                     found = d["daemon_id"]
                     break
             if not found:
-                await send_to_channel(msg, f"No daemon found matching `{short_id}`")
+                await send_to_channel(msg, f"No daemon found matching {short_id}")
                 return
             await self._daemon_manager.stop_daemon(found)
-            await send_to_channel(msg, f"⏹️ Daemon `{short_id}` stopped")
+            await send_to_channel(msg, f"Daemon {short_id} stopped")
             return
 
         # ─── SUBSCRIBE / UNSUBSCRIBE ─────
@@ -345,7 +345,7 @@ class CommandRouter:
                 self._event_bus.add_telegram_chat(int(msg.channel_id))
                 await send_to_channel(msg, "📡 *Subscribed to live feed*\nYou'll receive real-time agent activity.\n/unsubscribe to stop")
             elif self._event_bus:
-                await send_to_channel(msg, "📡 *Subscribed* — live events will be sent to this channel")
+                await send_to_channel(msg, "Subscribed — live events will be sent to this channel")
             return
 
         if command == "unsubscribe":
