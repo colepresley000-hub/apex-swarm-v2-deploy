@@ -2,7 +2,7 @@
 APEX SWARM v3.0 — Autonomous AI Agent Platform
 ================================================
 FastAPI backend with:
-  - 66 agents across 6 categories
+  - 85 agents across 6 categories
   - Smart knowledge retrieval (5-factor relevance scoring)
   - Agent tools: web search, URL fetch, crypto prices, code sandbox
   - Sequential pipelines (6 presets)
@@ -69,6 +69,8 @@ SLACK_DEFAULT_CHANNEL = os.getenv("SLACK_DEFAULT_CHANNEL", "#ai-workforce")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "apex_swarm.db")
 PORT = int(os.getenv("PORT", "8080"))
 VERSION = "4.0.0"
+TWITTERBOT_URL = os.getenv("TWITTERBOT_URL", "")          # e.g. https://apex-twitterbot.up.railway.app
+TWITTERBOT_SECRET = os.getenv("TWITTERBOT_SECRET", "")    # shared secret (CONTROL_API_SECRET in bot_service)
 
 # ─── OPTIONAL MODULE IMPORTS (graceful degradation) ───────
 
@@ -206,6 +208,15 @@ try:
 except ImportError:
     logger.warning("⚠️ a2a_protocol not found — no agent-to-agent delegation")
 
+# Gig Hunter
+GIG_HUNTER_AVAILABLE = False
+try:
+    from gig_hunter import run_gig_hunter, format_gig_results, firecrawl_scrape, firecrawl_search
+    GIG_HUNTER_AVAILABLE = True
+    logger.info("✅ gig_hunter loaded — Firecrawl-powered job scraper ready")
+except ImportError:
+    logger.warning("⚠️ gig_hunter not found")
+
 # Slash Skills
 SLASH_SKILLS_AVAILABLE = False
 try:
@@ -274,7 +285,7 @@ except ImportError:
     logger.warning("⚠️ smart_knowledge not found — using basic knowledge retrieval")
 
 
-# ─── AGENT DEFINITIONS (66 agents, 6 categories) ─────────
+# ─── AGENT DEFINITIONS (85 agents, 6 categories) ─────────
 
 AGENT_CATEGORIES = {
     "Crypto & DeFi": {
@@ -363,6 +374,7 @@ AGENT_CATEGORIES = {
     "Productivity": {
         "icon": "⚡",
         "agents": {
+            "gig-hunter": {"name": "Gig Hunter", "description": "Find and apply to freelance landing page & website jobs on Upwork, Fiverr, and Selar", "system": "You are an autonomous freelance job hunter specializing in landing pages, websites, and SaaS frontends. Search Upwork RSS feeds, Fiverr public listings, and other freelance platforms for relevant jobs. For each opportunity found, write a tailored 100-word proposal highlighting React, Tailwind, and conversion-focused design skills. Portfolio: swarmsfall.com. Filter for jobs with budget $100+. Output each job as: ALERT: [Platform] Job Title | Budget | Link | Proposal"},
             "task-planner": {"name": "Task Planner", "description": "Break down complex projects into actionable steps", "system": "You are a project planning expert. Break complex goals into structured, actionable task lists with priorities, dependencies, and timelines."},
             "meeting-summarizer": {"name": "Meeting Summarizer", "description": "Extract key points and action items from meetings", "system": "You are a meeting summarization specialist. Extract key decisions, action items, owners, and deadlines from meeting notes or transcripts."},
             "email-assistant": {"name": "Email Assistant", "description": "Draft, reply, and manage email communications", "system": "You are an email communication expert. Draft professional, clear, and effective emails for any context. Match tone to the situation."},
@@ -1113,6 +1125,18 @@ CREATE TABLE IF NOT EXISTS usage_log (
         }
         logger.info("✅ Polymarket Hunter daemon preset added")
 
+    # Add Gig Hunter daemon preset
+    if MISSION_CONTROL:
+        DAEMON_PRESETS["gig-hunter"] = {
+            "name": "Gig Hunter",
+            "description": "Finds landing page & website jobs on Upwork/Fiverr every 6 hours, writes proposals",
+            "agent_type": "gig-hunter",
+            "interval_seconds": 21600,  # Every 6 hours
+            "task_description": "Search Upwork RSS and Fiverr for new landing page, website design, and SaaS frontend jobs posted today. Budget $100+. For each relevant job found, write a tailored 100-word proposal. Report as ALERT with job title, budget, link, and proposal ready to send.",
+            "alert_conditions": ["ALERT", "job found", "opportunity"],
+        }
+        logger.info("✅ Gig Hunter daemon preset added")
+
     # Initialize enterprise components
     if ENTERPRISE:
         global conversation_store, audit_log
@@ -1177,6 +1201,22 @@ TIER_LIMITS = {
     "enterprise": {"max_agents_per_day": 9999, "max_daemons": 50, "max_schedules": 100, "tools": True},
     "admin": {"max_agents_per_day": 99999, "max_daemons": 999, "max_schedules": 999, "tools": True},
 }
+
+
+# ─── DAEMON TASK REGISTRY ─────────────────────────────────
+# Tracks running asyncio tasks by daemon_id so we can cancel them
+_daemon_tasks: dict = {}
+
+def register_daemon_task(daemon_id: str, task):
+    """Register a daemon's asyncio task for cancellation."""
+    _daemon_tasks[daemon_id] = task
+
+def cancel_daemon_task(daemon_id: str):
+    """Force-cancel a daemon's asyncio task."""
+    task = _daemon_tasks.pop(daemon_id, None)
+    if task and not task.done():
+        task.cancel()
+        logger.info(f"Force-cancelled daemon task {daemon_id[:8]}")
 
 
 async def send_slack_message(text: str, webhook_url: str = None, channel: str = None, blocks: list = None) -> bool:
@@ -1406,11 +1446,12 @@ def save_daemon_config(daemon_id: str, user_api_key: str, preset_id: str, agent_
 
 
 def remove_daemon_config(daemon_id: str):
-    """Remove daemon config from DB."""
+    """Remove daemon config from DB — hard delete so it never restores."""
     conn = get_db()
     try:
-        db_execute(conn, "UPDATE daemon_configs SET enabled = 0 WHERE id = ?", (daemon_id,))
+        db_execute(conn, "DELETE FROM daemon_configs WHERE id = ?", (daemon_id,))
         conn.commit()
+        logger.info(f"Daemon config deleted: {daemon_id[:8]}")
     except Exception as e:
         logger.error(f"Daemon config removal failed: {e}")
     finally:
@@ -1432,7 +1473,7 @@ async def restore_daemons():
     if not rows:
         return
 
-    logger.info(f"🔄 Restoring {len(rows)} daemon(s) from database...")
+    logger.info(f"Restoring {len(rows)} daemon(s) from database...")
     for row in rows:
         did, user_key, preset_id, agent_type, agent_name, task_desc, interval, max_cyc, alert_json = row
         try:
@@ -1783,7 +1824,7 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
         metrics_collector.record("agent.deployed", 1, {"type": agent_type})
 
     # ── PERSISTENCE: Inject conversation context ──
-    if ENTERPRISE and conversation_store:
+    if ENTERPRISE and conversation_store and not user_api_key.startswith("daemon:"):
         try:
             context = conversation_store.get_context(user_api_key, agent_type)
             if context:
@@ -1933,8 +1974,8 @@ async def execute_task(agent_id: str, agent_type: str, task_description: str, us
         finally:
             conn.close()
 
-        # ── PERSISTENCE: Save conversation turn ──
-        if ENTERPRISE and conversation_store and result:
+        # ── PERSISTENCE: Save conversation turn (skip daemon runs to prevent context snowball) ──
+        if ENTERPRISE and conversation_store and result and not user_api_key.startswith("daemon:"):
             try:
                 conversation_store.save_turn(user_api_key, agent_type, task_description[:500], result)
             except Exception:
@@ -2438,6 +2479,18 @@ async def handle_telegram_message(message: dict):
     if not chat_id or not text:
         return
 
+    # ─── HELLO / AGENT LIST ───────────────────────────────────
+    if text.strip().lower() in ("hello", "hi", "hey", "help", "agents", "start", "what can you do", "menu"):
+        lines = ["👋 *ApexSwarm — 85 AI Agents*\nSend `/agent-name your task` to start.\n"]
+        for cat_name, cat_data in AGENT_CATEGORIES.items():
+            lines.append(f"{cat_data['icon']} *{cat_name}*")
+            for key, agent in cat_data["agents"].items():
+                lines.append(f"  `/{key}` — {agent['name']}")
+            lines.append("")
+        lines.append("_Type `/start` for full command list._")
+        await send_telegram(chat_id, "\n".join(lines))
+        return
+
     # Check for slash skills first (e.g. /review, /plan-ceo-review)
     skill_key = None
     skill_data = None
@@ -2474,6 +2527,11 @@ async def handle_telegram_message(message: dict):
             "/stop_daemon <id> — Stop daemon\n"
             "/subscribe — Live feed\n"
             "/events — Recent activity\n\n"
+            "TWITTER BOT:\n"
+            "/twitter status — Bot state & counters\n"
+            "/twitter post — Fire a tweet now\n"
+            "/twitter pause — Halt scheduled tweets\n"
+            "/twitter resume — Resume schedule\n\n"
             "SLASH SKILLS:\n"
             "/skills — See all modes\n"
             "/review /monetize /ship /analyze /draft"
@@ -2596,6 +2654,69 @@ async def handle_telegram_message(message: dict):
         for e in events[-10:]:
             msg += f"• `{e['event_type']}` — {e['agent_name'] or e['agent_type']}: {e['message'][:80]}\n"
         await send_telegram(chat_id, msg)
+        return
+
+    # ─── TWITTERBOT CONTROL ───────────────────────────────
+    if agent_type == "twitter":
+        sub = task.strip().lower()
+
+        if not TWITTERBOT_URL:
+            await send_telegram(chat_id, "⚠️ TwitterBot not configured. Set TWITTERBOT_URL in Railway env vars.")
+            return
+
+        headers = {"x-control-secret": TWITTERBOT_SECRET} if TWITTERBOT_SECRET else {}
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as hc:
+
+                if sub in ("status", ""):
+                    r = await hc.get(f"{TWITTERBOT_URL}/status", headers=headers)
+                    d = r.json()
+                    paused = "⏸️ Paused" if d.get("paused") else "▶️ Running"
+                    msg = (
+                        f"🐦 *Twitter Bot Status*\n\n"
+                        f"State: {paused}\n"
+                        f"Account: `{d.get('authenticated_as', 'unknown')}`\n"
+                        f"Tweets posted: *{d.get('tweets_posted', 0)}*\n"
+                        f"Mentions replied: *{d.get('mentions_replied', 0)}*\n"
+                        f"Tweets liked: *{d.get('tweets_liked', 0)}*\n"
+                        f"Started: {d.get('started_at', 'N/A')[:19].replace('T', ' ')}\n"
+                    )
+                    if d.get("last_error"):
+                        msg += f"Last error: `{d['last_error'][:100]}`\n"
+                    await send_telegram(chat_id, msg)
+
+                elif sub == "post":
+                    r = await hc.post(f"{TWITTERBOT_URL}/tweet/now", headers=headers)
+                    d = r.json()
+                    await send_telegram(chat_id, f"✅ Tweet posted!\nID: `{d.get('tweet_id')}`\n\n_{d.get('text', '')[:200]}_")
+
+                elif sub.startswith("post "):
+                    custom_text = task[5:].strip()
+                    r = await hc.post(f"{TWITTERBOT_URL}/tweet/custom", headers=headers, json={"text": custom_text})
+                    d = r.json()
+                    await send_telegram(chat_id, f"✅ Custom tweet posted!\nID: `{d.get('tweet_id')}`")
+
+                elif sub == "pause":
+                    await hc.post(f"{TWITTERBOT_URL}/scheduler/pause", headers=headers)
+                    await send_telegram(chat_id, "⏸️ TwitterBot scheduler paused. Tweets halted until /twitter resume.")
+
+                elif sub == "resume":
+                    await hc.post(f"{TWITTERBOT_URL}/scheduler/resume", headers=headers)
+                    await send_telegram(chat_id, "▶️ TwitterBot scheduler resumed. Tweets will continue on schedule.")
+
+                else:
+                    await send_telegram(chat_id,
+                        "🐦 *TwitterBot Commands*\n\n"
+                        "`/twitter status` — check bot state & counters\n"
+                        "`/twitter post` — fire a random marketing tweet now\n"
+                        "`/twitter post Your text here` — post a custom tweet\n"
+                        "`/twitter pause` — halt scheduled tweets\n"
+                        "`/twitter resume` — resume schedule"
+                    )
+
+        except Exception as e:
+            await send_telegram(chat_id, f"❌ TwitterBot unreachable: `{str(e)[:120]}`")
         return
 
     # ─── REGULAR AGENT EXECUTION ─────
@@ -3993,9 +4114,31 @@ async def stop_daemon(daemon_id: str, api_key: str = Depends(get_api_key)):
     finally:
         conn.close()
     await daemon_manager.stop_daemon(found)
+    cancel_daemon_task(found)  # Force cancel asyncio task
     remove_daemon_config(found)
     return {"status": "stopped", "daemon_id": found}
 
+
+
+@app.delete("/api/v1/daemons")
+async def stop_all_daemons(api_key: str = Depends(get_api_key)):
+    """Stop ALL running daemons and clear from DB."""
+    if not MISSION_CONTROL:
+        raise HTTPException(status_code=503, detail="Mission Control not loaded")
+    stopped = []
+    for d in list(daemon_manager.get_daemons()):
+        did = d["daemon_id"]
+        try:
+            conn = get_db()
+            conn.execute("DELETE FROM daemon_configs WHERE id = ?", (did,))
+            conn.commit()
+            conn.close()
+            await daemon_manager.stop_daemon(did)
+            cancel_daemon_task(did)
+            stopped.append(did[:8])
+        except Exception as e:
+            logger.error(f"Stop all error for {did[:8]}: {e}")
+    return {"stopped": stopped, "count": len(stopped)}
 
 
 @app.get("/api/v1/daemons/{daemon_id}/soul")
@@ -4351,6 +4494,59 @@ async def polymarket_analyze_market(market_id: str, api_key: str = Depends(get_a
     )
     result["polymarket_url"] = market["url"]
     result["market_data_source"] = "polymarket"
+    return result
+
+
+
+# ─── GIG HUNTER ENDPOINTS ────────────────────────────────
+
+@app.post("/api/v1/gig-hunter/scan")
+async def gig_hunter_scan(request: Request, api_key: str = Depends(get_api_key)):
+    """Run a full gig hunt — scrape Upwork/Fiverr/Selar, generate proposals."""
+    if not GIG_HUNTER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Gig Hunter not loaded")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="Anthropic API key not configured")
+    data = {}
+    try:
+        data = await request.json()
+    except Exception:
+        pass
+    generate_proposals = data.get("generate_proposals", True)
+    max_results = min(int(data.get("max_results", 5)), 10)
+    results = await run_gig_hunter(
+        anthropic_api_key=ANTHROPIC_API_KEY,
+        model=CLAUDE_MODEL,
+        generate_proposals=generate_proposals,
+        max_results=max_results,
+    )
+    return {
+        "gigs_found": len(results),
+        "results": results,
+        "formatted": format_gig_results(results),
+    }
+
+
+@app.get("/api/v1/gig-hunter/upwork")
+async def gig_hunter_upwork(q: str = "landing page", api_key: str = Depends(get_api_key)):
+    """Fetch jobs from Upwork RSS feed."""
+    if not GIG_HUNTER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Gig Hunter not loaded")
+    from gig_hunter import fetch_upwork_jobs
+    jobs = await fetch_upwork_jobs([q], limit=10)
+    return {"jobs": jobs, "count": len(jobs)}
+
+
+@app.get("/api/v1/gig-hunter/scrape")
+async def gig_hunter_scrape(url: str, api_key: str = Depends(get_api_key)):
+    """Scrape any URL using Firecrawl."""
+    if not GIG_HUNTER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Gig Hunter not loaded")
+    if not os.getenv("FIRECRAWL_API_KEY"):
+        raise HTTPException(status_code=503, detail="FIRECRAWL_API_KEY not set")
+    result = await firecrawl_scrape(url)
+    if not result:
+        raise HTTPException(status_code=500, detail="Scrape failed")
     return result
 
 
